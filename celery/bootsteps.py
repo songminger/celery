@@ -1,33 +1,27 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.bootsteps
-    ~~~~~~~~~~~~~~~~
-
-    The bootsteps!
-
-"""
+"""A directed acyclic graph of reusable components."""
 from __future__ import absolute_import, unicode_literals
 
 from collections import deque
 from threading import Event
 
 from kombu.common import ignore_errors
-from kombu.utils import symbol_by_name
+from kombu.utils.encoding import bytes_to_str
+from kombu.utils.imports import symbol_by_name
 
-from .datastructures import DependencyGraph, GraphFormatter
-from .five import values, with_metaclass
+from .five import bytes_if_py2, values, with_metaclass
+from .utils.graph import DependencyGraph, GraphFormatter
 from .utils.imports import instantiate, qualname
 from .utils.log import get_logger
-from .utils.threads import default_socket_timeout
 
 try:
     from greenlet import GreenletExit
-    IGNORE_ERRORS = (GreenletExit, )
 except ImportError:  # pragma: no cover
     IGNORE_ERRORS = ()
+else:
+    IGNORE_ERRORS = (GreenletExit,)
 
-#: Default socket timeout at shutdown.
-SHUTDOWN_SOCKET_TIMEOUT = 5.0
+__all__ = ('Blueprint', 'Step', 'StartStopStep', 'ConsumerStep')
 
 #: States
 RUN = 0x1
@@ -35,7 +29,6 @@ CLOSE = 0x2
 TERMINATE = 0x3
 
 logger = get_logger(__name__)
-debug = logger.debug
 
 
 def _pre(ns, fmt):
@@ -47,10 +40,11 @@ def _label(s):
 
 
 class StepFormatter(GraphFormatter):
+    """Graph formatter for :class:`Blueprint`."""
 
-    namespace_prefix = '⧉'
+    blueprint_prefix = '⧉'
     conditional_prefix = '∘'
-    namespace_scheme = {
+    blueprint_scheme = {
         'shape': 'parallelogram',
         'color': 'slategray4',
         'fillcolor': 'slategray3',
@@ -59,18 +53,19 @@ class StepFormatter(GraphFormatter):
     def label(self, step):
         return step and '{0}{1}'.format(
             self._get_prefix(step),
-            (step.label or _label(step)).encode('utf-8', 'ignore'),
+            bytes_to_str(
+                (step.label or _label(step)).encode('utf-8', 'ignore')),
         )
 
     def _get_prefix(self, step):
         if step.last:
-            return self.namespace_prefix
+            return self.blueprint_prefix
         if step.conditional:
             return self.conditional_prefix
         return ''
 
     def node(self, obj, **attrs):
-        scheme = self.namespace_scheme if obj.last else self.node_scheme
+        scheme = self.blueprint_scheme if obj.last else self.node_scheme
         return self.draw_node(obj, scheme, attrs)
 
     def edge(self, a, b, **attrs):
@@ -79,27 +74,33 @@ class StepFormatter(GraphFormatter):
         return self.draw_edge(a, b, self.edge_scheme, attrs)
 
 
-class Namespace(object):
-    """A namespace containing bootsteps.
+class Blueprint(object):
+    """Blueprint containing bootsteps that can be applied to objects.
 
-    :keyword steps: List of steps.
-    :keyword name: Set explicit name for this namespace.
-    :keyword app: Set the Celery app for this namespace.
-    :keyword on_start: Optional callback applied after namespace start.
-    :keyword on_close: Optional callback applied before namespace close.
-    :keyword on_stopped: Optional callback applied after namespace stopped.
-
+    Arguments:
+        steps Sequence[Union[str, Step]]: List of steps.
+        name (str): Set explicit name for this blueprint.
+        on_start (Callable): Optional callback applied after blueprint start.
+        on_close (Callable): Optional callback applied before blueprint close.
+        on_stopped (Callable): Optional callback applied after
+            blueprint stopped.
     """
+
     GraphFormatter = StepFormatter
 
     name = None
     state = None
     started = 0
     default_steps = set()
+    state_to_name = {
+        0: 'initializing',
+        RUN: 'running',
+        CLOSE: 'closing',
+        TERMINATE: 'terminating',
+    }
 
-    def __init__(self, steps=None, name=None, app=None,
+    def __init__(self, steps=None, name=None,
                  on_start=None, on_close=None, on_stopped=None):
-        self.app = app
         self.name = name or self.name or qualname(type(self))
         self.types = set(steps or []) | set(self.default_steps)
         self.on_start = on_start
@@ -116,7 +117,10 @@ class Namespace(object):
             self._debug('Starting %s', step.alias)
             self.started = i + 1
             step.start(parent)
-            debug('^-- substep ok')
+            logger.debug('^-- substep ok')
+
+    def human_state(self):
+        return self.state_to_name[self.state or 0]
 
     def info(self, parent):
         info = {}
@@ -127,24 +131,32 @@ class Namespace(object):
     def close(self, parent):
         if self.on_close:
             self.on_close()
-        self.send_all(parent, 'close', 'Closing', reverse=False)
+        self.send_all(parent, 'close', 'closing', reverse=False)
 
-    def restart(self, parent, method='stop', description='Restarting'):
-        self.send_all(parent, method, description)
+    def restart(self, parent, method='stop',
+                description='restarting', propagate=False):
+        self.send_all(parent, method, description, propagate=propagate)
 
-    def send_all(self, parent, method, description=None, reverse=True):
-        description = description or method.capitalize()
+    def send_all(self, parent, method,
+                 description=None, reverse=True, propagate=True, args=()):
+        description = description or method.replace('_', ' ')
         steps = reversed(parent.steps) if reverse else parent.steps
-        with default_socket_timeout(SHUTDOWN_SOCKET_TIMEOUT):  # Issue 975
-            for step in steps:
-                if step:
-                    self._debug('%s %s...', description, step.alias)
-                    fun = getattr(step, method, None)
-                    if fun:
-                        fun(parent)
+        for step in steps:
+            if step:
+                fun = getattr(step, method, None)
+                if fun is not None:
+                    self._debug('%s %s...',
+                                description.capitalize(), step.alias)
+                    try:
+                        fun(parent, *args)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        if propagate:
+                            raise
+                        logger.exception(
+                            'Error on %s %s: %r', description, step.alias, exc)
 
     def stop(self, parent, close=True, terminate=False):
-        what = 'Terminating' if terminate else 'Stopping'
+        what = 'terminating' if terminate else 'stopping'
         if self.state in (CLOSE, TERMINATE):
             return
 
@@ -155,7 +167,11 @@ class Namespace(object):
             return
         self.close(parent)
         self.state = CLOSE
-        self.restart(parent, 'terminate' if terminate else 'stop', what)
+
+        self.restart(
+            parent, 'terminate' if terminate else 'stop',
+            description=what, propagate=False,
+        )
 
         if self.on_stopped:
             self.on_stopped()
@@ -171,7 +187,7 @@ class Namespace(object):
             pass
 
     def apply(self, parent, **kwargs):
-        """Apply the steps in this namespace to an object.
+        """Apply the steps in this blueprint to an object.
 
         This will apply the ``__init__`` and ``include`` methods
         of each step, with the object as argument::
@@ -182,7 +198,6 @@ class Namespace(object):
 
         For :class:`StartStopStep` the services created
         will also be added to the objects ``steps`` attribute.
-
         """
         self._debug('Preparing bootsteps.')
         order = self.order = []
@@ -207,11 +222,11 @@ class Namespace(object):
         return self.steps[name]
 
     def _find_last(self):
-        for C in values(self.steps):
-            if C.last:
-                return C
+        return next((C for C in values(self.steps) if C.last), None)
 
     def _firstpass(self, steps):
+        for step in values(steps):
+            step.requires = [symbol_by_name(dep) for dep in step.requires]
         stream = deque(step.requires for step in values(steps))
         while stream:
             for node in stream.popleft():
@@ -237,17 +252,14 @@ class Namespace(object):
             raise KeyError('unknown bootstep: %s' % exc)
 
     def claim_steps(self):
-        return dict(self.load_step(step) for step in self._all_steps())
-
-    def _all_steps(self):
-        return self.types | self.app.steps[self.name.lower()]
+        return dict(self.load_step(step) for step in self.types)
 
     def load_step(self, step):
         step = symbol_by_name(step)
         return step.name, step
 
     def _debug(self, msg, *args):
-        return debug(_pre(self, msg), *args)
+        return logger.debug(_pre(self, msg), *args)
 
     @property
     def alias(self):
@@ -255,7 +267,10 @@ class Namespace(object):
 
 
 class StepType(type):
-    """Metaclass for steps."""
+    """Meta-class for steps."""
+
+    name = None
+    requires = None
 
     def __new__(cls, name, bases, attrs):
         module = attrs.get('__module__')
@@ -263,15 +278,14 @@ class StepType(type):
         attrs.update(
             __qualname__=qname,
             name=attrs.get('name') or qname,
-            requires=attrs.get('requires', ()),
         )
         return super(StepType, cls).__new__(cls, name, bases, attrs)
 
-    def __str__(self):
-        return self.name
+    def __str__(cls):
+        return bytes_if_py2(cls.name)
 
-    def __repr__(self):
-        return 'step:{0.name}{{{0.requires!r}}}'.format(self)
+    def __repr__(cls):
+        return bytes_if_py2('step:{0.name}{{{0.requires!r}}}'.format(cls))
 
 
 @with_metaclass(StepType)
@@ -282,10 +296,9 @@ class Step(object):
     is bound to a parent object, and can as such be used
     to initialize attributes in the parent object at
     parent instantiation-time.
-
     """
 
-    #: Optional step name, will use qualname if not specified.
+    #: Optional step name, will use ``qualname`` if not specified.
     name = None
 
     #: Optional short name used for graph outputs and in logs.
@@ -295,13 +308,13 @@ class Step(object):
     conditional = False
 
     #: List of other steps that that must be started before this step.
-    #: Note that all dependencies must be in the same namespace.
+    #: Note that all dependencies must be in the same blueprint.
     requires = ()
 
     #: This flag is reserved for the workers Consumer,
     #: since it is required to always be started last.
-    #: There can only be one object marked with lsat
-    #: in every namespace.
+    #: There can only be one object marked last
+    #: in every blueprint.
     last = False
 
     #: This provides the default for :meth:`include_if`.
@@ -311,8 +324,11 @@ class Step(object):
         pass
 
     def include_if(self, parent):
-        """An optional predicate that decided whether this
-        step should be created."""
+        """Return true if bootstep should be included.
+
+        You can define this as an optional predicate that decides whether
+        this step should be created.
+        """
         return self.enabled
 
     def instantiate(self, name, *args, **kwargs):
@@ -328,10 +344,9 @@ class Step(object):
 
     def create(self, parent):
         """Create the step."""
-        pass
 
     def __repr__(self):
-        return '<step: {0.alias}>'.format(self)
+        return bytes_if_py2('<step: {0.alias}>'.format(self))
 
     @property
     def alias(self):
@@ -342,6 +357,7 @@ class Step(object):
 
 
 class StartStopStep(Step):
+    """Bootstep that must be started and stopped in order."""
 
     #: Optional obj created by the :meth:`create` method.
     #: This is used by :class:`StartStopStep` to keep the
@@ -360,7 +376,8 @@ class StartStopStep(Step):
         pass
 
     def terminate(self, parent):
-        self.stop(parent)
+        if self.obj:
+            return getattr(self.obj, 'terminate', self.obj.stop)()
 
     def include(self, parent):
         inc, ret = self._should_include(parent)
@@ -371,23 +388,32 @@ class StartStopStep(Step):
 
 
 class ConsumerStep(StartStopStep):
-    requires = ('Connection', )
+    """Bootstep that starts a message consumer."""
+
+    requires = ('celery.worker.consumer:Connection',)
     consumers = None
 
     def get_consumers(self, channel):
         raise NotImplementedError('missing get_consumers')
 
     def start(self, c):
-        self.consumers = self.get_consumers(c.connection)
+        channel = c.connection.channel()
+        self.consumers = self.get_consumers(channel)
         for consumer in self.consumers or []:
             consumer.consume()
 
     def stop(self, c):
-        for consumer in self.consumers or []:
-            ignore_errors(c.connection, consumer.cancel)
+        self._close(c, True)
 
     def shutdown(self, c):
-        self.stop(c)
+        self._close(c, False)
+
+    def _close(self, c, cancel_consumers=True):
+        channels = set()
         for consumer in self.consumers or []:
+            if cancel_consumers:
+                ignore_errors(c.connection, consumer.cancel)
             if consumer.channel:
-                ignore_errors(c.connection, consumer.channel.close)
+                channels.add(consumer.channel)
+        for channel in channels:
+            ignore_errors(c.connection, channel.close)

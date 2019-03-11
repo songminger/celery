@@ -1,33 +1,27 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.loaders.base
-    ~~~~~~~~~~~~~~~~~~~
+"""Loader base class."""
+from __future__ import absolute_import, unicode_literals
 
-    Loader base class.
-
-"""
-from __future__ import absolute_import
-
-import anyjson
-import imp
 import importlib
 import os
 import re
 import sys
-
 from datetime import datetime
 
-from kombu.utils import cached_property
-from kombu.utils.encoding import safe_str
+from kombu.utils import json
+from kombu.utils.objects import cached_property
 
-from celery.datastructures import DictAttribute
+from celery import signals
 from celery.five import reraise, string_t
+from celery.utils.collections import DictAttribute, force_mapping
 from celery.utils.functional import maybe_list
-from celery.utils.imports import (
-    import_from_cwd, symbol_by_name, NotAPackage, find_module,
-)
+from celery.utils.imports import (NotAPackage, find_module, import_from_cwd,
+                                  symbol_by_name)
+
+__all__ = ('BaseLoader',)
 
 _RACE_PROTECTION = False
+
 CONFIG_INVALID_NAME = """\
 Error: Module '{module}' doesn't exist, or it's not a valid \
 Python module name.
@@ -37,9 +31,11 @@ CONFIG_WITH_SUFFIX = CONFIG_INVALID_NAME + """\
 Did you mean '{suggest}'?
 """
 
+unconfigured = object()
+
 
 class BaseLoader(object):
-    """The base class for loaders.
+    """Base class for loaders.
 
     Loaders handles,
 
@@ -55,18 +51,17 @@ class BaseLoader(object):
             See :meth:`on_worker_shutdown`.
 
         * What modules are imported to find tasks?
-
     """
+
     builtin_modules = frozenset()
     configured = False
     override_backends = {}
     worker_initialized = False
 
-    _conf = None
+    _conf = unconfigured
 
-    def __init__(self, app=None, **kwargs):
-        from celery.app import app_or_default
-        self.app = app_or_default(app)
+    def __init__(self, app, **kwargs):
+        self.app = app
         self.task_modules = set()
 
     def now(self, utc=True):
@@ -75,26 +70,19 @@ class BaseLoader(object):
         return datetime.now()
 
     def on_task_init(self, task_id, task):
-        """This method is called before a task is executed."""
-        pass
+        """Called before a task is executed."""
 
     def on_process_cleanup(self):
-        """This method is called after a task is executed."""
-        pass
+        """Called after a task is executed."""
 
     def on_worker_init(self):
-        """This method is called when the worker (:program:`celery worker`)
-        starts."""
-        pass
+        """Called when the worker (:program:`celery worker`) starts."""
 
     def on_worker_shutdown(self):
-        """This method is called when the worker (:program:`celery worker`)
-        shuts down."""
-        pass
+        """Called when the worker (:program:`celery worker`) shuts down."""
 
     def on_worker_process_init(self):
-        """This method is called when a child process starts."""
-        pass
+        """Called when a child process starts."""
 
     def import_task_module(self, module):
         self.task_modules.add(module)
@@ -111,13 +99,14 @@ class BaseLoader(object):
         )
 
     def import_default_modules(self):
-        return [
-            self.import_task_module(m) for m in (
-                tuple(self.builtin_modules) +
-                tuple(maybe_list(self.app.conf.CELERY_IMPORTS)) +
-                tuple(maybe_list(self.app.conf.CELERY_INCLUDE))
-            )
-        ]
+        responses = signals.import_modules.send(sender=self.app)
+        # Prior to this point loggers are not yet set up properly, need to
+        #   check responses manually and reraised exceptions if any, otherwise
+        #   they'll be silenced, making it incredibly difficult to debug.
+        for _, response in responses:
+            if isinstance(response, Exception):
+                raise response
+        return [self.import_task_module(m) for m in self.default_modules]
 
     def init_worker(self):
         if not self.worker_initialized:
@@ -134,18 +123,28 @@ class BaseLoader(object):
     def config_from_object(self, obj, silent=False):
         if isinstance(obj, string_t):
             try:
-                if '.' in obj:
-                    obj = symbol_by_name(obj, imp=self.import_from_cwd)
-                else:
-                    obj = self.import_from_cwd(obj)
+                obj = self._smart_import(obj, imp=self.import_from_cwd)
             except (ImportError, AttributeError):
                 if silent:
                     return False
                 raise
-        if not hasattr(obj, '__getitem__'):
-            obj = DictAttribute(obj)
-        self._conf = obj
+        self._conf = force_mapping(obj)
         return True
+
+    def _smart_import(self, path, imp=None):
+        imp = self.import_module if imp is None else imp
+        if ':' in path:
+            # Path includes attribute so can just jump
+            # here (e.g., ``os.path:abspath``).
+            return symbol_by_name(path, imp=imp)
+
+        # Not sure if path is just a module name or if it includes an
+        # attribute name (e.g., ``os.path``, vs, ``os.path.abspath``).
+        try:
+            return imp(path)
+        except ImportError:
+            # Not a module name, so try module + attribute.
+            return symbol_by_name(path, imp=imp)
 
     def _import_config_module(self, name):
         try:
@@ -162,32 +161,33 @@ class BaseLoader(object):
     def find_module(self, module):
         return find_module(module)
 
-    def cmdline_config_parser(
-            self, args, namespace='celery',
-            re_type=re.compile(r'\((\w+)\)'),
-            extra_types={'json': anyjson.loads},
-            override_types={'tuple': 'json',
-                            'list': 'json',
-                            'dict': 'json'}):
+    def cmdline_config_parser(self, args, namespace='celery',
+                              re_type=re.compile(r'\((\w+)\)'),
+                              extra_types=None,
+                              override_types=None):
+        extra_types = extra_types if extra_types else {'json': json.loads}
+        override_types = override_types if override_types else {
+            'tuple': 'json',
+            'list': 'json',
+            'dict': 'json'
+        }
         from celery.app.defaults import Option, NAMESPACES
-        namespace = namespace.upper()
+        namespace = namespace and namespace.lower()
         typemap = dict(Option.typemap, **extra_types)
 
         def getarg(arg):
-            """Parse a single configuration definition from
-            the command-line."""
-
-            ## find key/value
+            """Parse single configuration from command-line."""
+            # ## find key/value
             # ns.key=value|ns_key=value (case insensitive)
             key, value = arg.split('=', 1)
-            key = key.upper().replace('.', '_')
+            key = key.lower().replace('.', '_')
 
-            ## find namespace.
-            # .key=value|_key=value expands to default namespace.
+            # ## find name-space.
+            # .key=value|_key=value expands to default name-space.
             if key[0] == '_':
                 ns, key = namespace, key[1:]
             else:
-                # find namespace part of key
+                # find name-space part of key
                 ns, key = key.split('_', 1)
 
             ns_key = (ns and ns + '_' or '') + key
@@ -201,58 +201,49 @@ class BaseLoader(object):
                 value = typemap[type_](value)
             else:
                 try:
-                    value = NAMESPACES[ns][key].to_python(value)
+                    value = NAMESPACES[ns.lower()][key].to_python(value)
                 except ValueError as exc:
                     # display key name in error message.
                     raise ValueError('{0!r}: {1}'.format(ns_key, exc))
             return ns_key, value
         return dict(getarg(arg) for arg in args)
 
-    def mail_admins(self, subject, body, fail_silently=False,
-                    sender=None, to=None, host=None, port=None,
-                    user=None, password=None, timeout=None,
-                    use_ssl=False, use_tls=False):
-        message = self.mail.Message(sender=sender, to=to,
-                                    subject=safe_str(subject),
-                                    body=safe_str(body))
-        mailer = self.mail.Mailer(host=host, port=port,
-                                  user=user, password=password,
-                                  timeout=timeout, use_ssl=use_ssl,
-                                  use_tls=use_tls)
-        mailer.send(message, fail_silently=fail_silently)
-
-    def read_configuration(self):
+    def read_configuration(self, env='CELERY_CONFIG_MODULE'):
         try:
-            custom_config = os.environ['CELERY_CONFIG_MODULE']
+            custom_config = os.environ[env]
         except KeyError:
             pass
         else:
-            usercfg = self._import_config_module(custom_config)
-            return DictAttribute(usercfg)
-        return {}
+            if custom_config:
+                usercfg = self._import_config_module(custom_config)
+                return DictAttribute(usercfg)
 
     def autodiscover_tasks(self, packages, related_name='tasks'):
         self.task_modules.update(
-            mod.__name__ for mod in autodiscover_tasks(packages,
+            mod.__name__ for mod in autodiscover_tasks(packages or (),
                                                        related_name) if mod)
+
+    @cached_property
+    def default_modules(self):
+        return (
+            tuple(self.builtin_modules) +
+            tuple(maybe_list(self.app.conf.imports)) +
+            tuple(maybe_list(self.app.conf.include))
+        )
 
     @property
     def conf(self):
         """Loader configuration."""
-        if self._conf is None:
+        if self._conf is unconfigured:
             self._conf = self.read_configuration()
         return self._conf
-
-    @cached_property
-    def mail(self):
-        return self.import_module('celery.utils.mail')
 
 
 def autodiscover_tasks(packages, related_name='tasks'):
     global _RACE_PROTECTION
 
     if _RACE_PROTECTION:
-        return
+        return ()
     _RACE_PROTECTION = True
     try:
         return [find_related_module(pkg, related_name) for pkg in packages]
@@ -261,17 +252,19 @@ def autodiscover_tasks(packages, related_name='tasks'):
 
 
 def find_related_module(package, related_name):
-    """Given a package name and a module name, tries to find that
-    module."""
+    """Find module in package."""
+    # Django 1.7 allows for speciying a class name in INSTALLED_APPS.
+    # (Issue #2248).
+    try:
+        module = importlib.import_module(package)
+        if not related_name and module:
+            return module
+    except ImportError:
+        package, _, _ = package.rpartition('.')
+        if not package:
+            raise
 
     try:
-        pkg_path = importlib.import_module(package).__path__
-    except AttributeError:
-        return
-
-    try:
-        imp.find_module(related_name, pkg_path)
+        return importlib.import_module('{0}.{1}'.format(package, related_name))
     except ImportError:
         return
-
-    return importlib.import_module('{0}.{1}'.format(package, related_name))

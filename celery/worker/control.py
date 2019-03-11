@@ -1,285 +1,561 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.worker.control
-    ~~~~~~~~~~~~~~~~~~~~~
+"""Worker remote control command implementations."""
+from __future__ import absolute_import, unicode_literals
 
-    Remote control commands.
+import io
+import tempfile
+from collections import namedtuple
 
-"""
-from __future__ import absolute_import
-
-import logging
-
+from billiard.common import TERM_SIGNAME
 from kombu.utils.encoding import safe_repr
 
-from celery.five import UserDict, items
+from celery.exceptions import WorkerShutdown
+from celery.five import UserDict, items, string_t, text_t
 from celery.platforms import signals as _signals
-from celery.utils import timeutils
+from celery.utils.functional import maybe_list
 from celery.utils.log import get_logger
-from celery.utils import jsonify
+from celery.utils.serialization import jsonify, strtobool
+from celery.utils.time import rate
 
-from . import state
-from .state import revoked
+from . import state as worker_state
+from .request import Request
+
+__all__ = ('Panel',)
 
 DEFAULT_TASK_INFO_ITEMS = ('exchange', 'routing_key', 'rate_limit')
 logger = get_logger(__name__)
 
+controller_info_t = namedtuple('controller_info_t', [
+    'alias', 'type', 'visible', 'default_timeout',
+    'help', 'signature', 'args', 'variadic',
+])
+
+
+def ok(value):
+    return {'ok': value}
+
+
+def nok(value):
+    return {'error': value}
+
 
 class Panel(UserDict):
-    data = dict()  # Global registry.
+    """Global registry of remote control commands."""
+
+    data = {}      # global dict.
+    meta = {}      # -"-
 
     @classmethod
-    def register(cls, method, name=None):
-        cls.data[name or method.__name__] = method
-        return method
+    def register(cls, *args, **kwargs):
+        if args:
+            return cls._register(**kwargs)(*args)
+        return cls._register(**kwargs)
+
+    @classmethod
+    def _register(cls, name=None, alias=None, type='control',
+                  visible=True, default_timeout=1.0, help=None,
+                  signature=None, args=None, variadic=None):
+
+        def _inner(fun):
+            control_name = name or fun.__name__
+            _help = help or (fun.__doc__ or '').strip().split('\n')[0]
+            cls.data[control_name] = fun
+            cls.meta[control_name] = controller_info_t(
+                alias, type, visible, default_timeout,
+                _help, signature, args, variadic)
+            if alias:
+                cls.data[alias] = fun
+            return fun
+        return _inner
 
 
-@Panel.register
-def revoke(panel, task_id, terminate=False, signal=None, **kwargs):
-    """Revoke task by task id."""
-    revoked.add(task_id)
-    if terminate:
-        signum = _signals.signum(signal or 'TERM')
-        for request in state.reserved_requests:
-            if request.id == task_id:
-                logger.info('Terminating %s (%s)', task_id, signum)
-                request.terminate(panel.consumer.pool, signal=signum)
-                break
-        else:
-            return {'ok': 'terminate: task {0} not found'.format(task_id)}
-        return {'ok': 'terminating {0} ({1})'.format(task_id, signal)}
-
-    logger.info('Revoking task %s', task_id)
-    return {'ok': 'revoking task {0}'.format(task_id)}
+def control_command(**kwargs):
+    return Panel.register(type='control', **kwargs)
 
 
-@Panel.register
-def report(panel):
-    return {'ok': panel.app.bugreport()}
+def inspect_command(**kwargs):
+    return Panel.register(type='inspect', **kwargs)
+
+# -- App
 
 
-@Panel.register
-def enable_events(panel):
-    dispatcher = panel.consumer.event_dispatcher
-    if 'task' not in dispatcher.groups:
-        dispatcher.groups.add('task')
-        logger.info('Events of group {task} enabled by remote.')
-        return {'ok': 'task events enabled'}
-    return {'ok': 'task events already enabled'}
+@inspect_command()
+def report(state):
+    """Information about Celery installation for bug reports."""
+    return ok(state.app.bugreport())
 
 
-@Panel.register
-def disable_events(panel):
-    dispatcher = panel.consumer.event_dispatcher
-    if 'task' in dispatcher.groups:
-        dispatcher.groups.discard('task')
-        logger.info('Events of group {task} disabled by remote.')
-        return {'ok': 'task events disabled'}
-    return {'ok': 'task events already disabled'}
+@inspect_command(
+    alias='dump_conf',  # XXX < backwards compatible
+    signature='[include_defaults=False]',
+    args=[('with_defaults', strtobool)],
+)
+def conf(state, with_defaults=False, **kwargs):
+    """List configuration."""
+    return jsonify(state.app.conf.table(with_defaults=with_defaults),
+                   keyfilter=_wanted_config_key,
+                   unknown_type_filter=safe_repr)
 
 
-@Panel.register
-def heartbeat(panel):
-    logger.debug('Heartbeat requested by remote.')
-    dispatcher = panel.consumer.event_dispatcher
-    dispatcher.send('worker-heartbeat', freq=5, **state.SOFTWARE_INFO)
+def _wanted_config_key(key):
+    return isinstance(key, string_t) and not key.startswith('__')
 
 
-@Panel.register
-def rate_limit(panel, task_name, rate_limit, **kwargs):
-    """Set new rate limit for a task type.
+# -- Task
 
-    See :attr:`celery.task.base.Task.rate_limit`.
+@inspect_command(
+    variadic='ids',
+    signature='[id1 [id2 [... [idN]]]]',
+)
+def query_task(state, ids, **kwargs):
+    """Query for task information by id."""
+    return {
+        req.id: (_state_of_task(req), req.info())
+        for req in _find_requests_by_id(maybe_list(ids))
+    }
 
-    :param task_name: Type of task.
-    :param rate_limit: New rate limit.
 
+def _find_requests_by_id(ids,
+                         get_request=worker_state.requests.__getitem__):
+    for task_id in ids:
+        try:
+            yield get_request(task_id)
+        except KeyError:
+            pass
+
+
+def _state_of_task(request,
+                   is_active=worker_state.active_requests.__contains__,
+                   is_reserved=worker_state.reserved_requests.__contains__):
+    if is_active(request):
+        return 'active'
+    elif is_reserved(request):
+        return 'reserved'
+    return 'ready'
+
+
+@control_command(
+    variadic='task_id',
+    signature='[id1 [id2 [... [idN]]]]',
+)
+def revoke(state, task_id, terminate=False, signal=None, **kwargs):
+    """Revoke task by task id (or list of ids).
+
+    Keyword Arguments:
+        terminate (bool): Also terminate the process if the task is active.
+        signal (str): Name of signal to use for terminate (e.g., ``KILL``).
     """
+    # pylint: disable=redefined-outer-name
+    # XXX Note that this redefines `terminate`:
+    #     Outside of this scope that is a function.
+    # supports list argument since 3.1
+    task_ids, task_id = set(maybe_list(task_id) or []), None
+    size = len(task_ids)
+    terminated = set()
 
+    worker_state.revoked.update(task_ids)
+    if terminate:
+        signum = _signals.signum(signal or TERM_SIGNAME)
+        for request in _find_requests_by_id(task_ids):
+            if request.id not in terminated:
+                terminated.add(request.id)
+                logger.info('Terminating %s (%s)', request.id, signum)
+                request.terminate(state.consumer.pool, signal=signum)
+                if len(terminated) >= size:
+                    break
+
+        if not terminated:
+            return ok('terminate: tasks unknown')
+        return ok('terminate: {0}'.format(', '.join(terminated)))
+
+    idstr = ', '.join(task_ids)
+    logger.info('Tasks flagged as revoked: %s', idstr)
+    return ok('tasks {0} flagged as revoked'.format(idstr))
+
+
+@control_command(
+    variadic='task_id',
+    args=[('signal', text_t)],
+    signature='<signal> [id1 [id2 [... [idN]]]]'
+)
+def terminate(state, signal, task_id, **kwargs):
+    """Terminate task by task id (or list of ids)."""
+    return revoke(state, task_id, terminate=True, signal=signal)
+
+
+@control_command(
+    args=[('task_name', text_t), ('rate_limit', text_t)],
+    signature='<task_name> <rate_limit (e.g., 5/s | 5/m | 5/h)>',
+)
+def rate_limit(state, task_name, rate_limit, **kwargs):
+    """Tell worker(s) to modify the rate limit for a task by type.
+
+    See Also:
+        :attr:`celery.task.base.Task.rate_limit`.
+
+    Arguments:
+        task_name (str): Type of task to set rate limit for.
+        rate_limit (int, str): New rate limit.
+    """
+    # pylint: disable=redefined-outer-name
+    # XXX Note that this redefines `terminate`:
+    #     Outside of this scope that is a function.
     try:
-        timeutils.rate(rate_limit)
+        rate(rate_limit)
     except ValueError as exc:
-        return {'error': 'Invalid rate limit string: {0!r}'.format(exc)}
+        return nok('Invalid rate limit string: {0!r}'.format(exc))
 
     try:
-        panel.app.tasks[task_name].rate_limit = rate_limit
+        state.app.tasks[task_name].rate_limit = rate_limit
     except KeyError:
         logger.error('Rate limit attempt for unknown task %s',
                      task_name, exc_info=True)
-        return {'error': 'unknown task'}
+        return nok('unknown task')
 
-    panel.consumer.reset_rate_limits()
+    state.consumer.reset_rate_limits()
 
     if not rate_limit:
         logger.info('Rate limits disabled for tasks of type %s', task_name)
-        return {'ok': 'rate limit disabled successfully'}
+        return ok('rate limit disabled successfully')
 
     logger.info('New rate limit for tasks of type %s: %s.',
                 task_name, rate_limit)
-    return {'ok': 'new rate limit set successfully'}
+    return ok('new rate limit set successfully')
 
 
-@Panel.register
-def time_limit(panel, task_name=None, hard=None, soft=None, **kwargs):
+@control_command(
+    args=[('task_name', text_t), ('soft', float), ('hard', float)],
+    signature='<task_name> <soft_secs> [hard_secs]',
+)
+def time_limit(state, task_name=None, hard=None, soft=None, **kwargs):
+    """Tell worker(s) to modify the time limit for task by type.
+
+    Arguments:
+        task_name (str): Name of task to change.
+        hard (float): Hard time limit.
+        soft (float): Soft time limit.
+    """
     try:
-        task = panel.app.tasks[task_name]
+        task = state.app.tasks[task_name]
     except KeyError:
         logger.error('Change time limit attempt for unknown task %s',
                      task_name, exc_info=True)
-        return {'error': 'unknown task'}
+        return nok('unknown task')
 
     task.soft_time_limit = soft
     task.time_limit = hard
 
     logger.info('New time limits for tasks of type %s: soft=%s hard=%s',
                 task_name, soft, hard)
-    return {'ok': 'time limits set successfully'}
+    return ok('time limits set successfully')
 
 
-@Panel.register
-def dump_schedule(panel, safe=False, **kwargs):
-    from celery.worker.job import Request
-    schedule = panel.consumer.timer.schedule
-    if not schedule.queue:
+# -- Events
+
+
+@inspect_command()
+def clock(state, **kwargs):
+    """Get current logical clock value."""
+    return {'clock': state.app.clock.value}
+
+
+@control_command()
+def election(state, id, topic, action=None, **kwargs):
+    """Hold election.
+
+    Arguments:
+        id (str): Unique election id.
+        topic (str): Election topic.
+        action (str): Action to take for elected actor.
+    """
+    if state.consumer.gossip:
+        state.consumer.gossip.election(id, topic, action)
+
+
+@control_command()
+def enable_events(state):
+    """Tell worker(s) to send task-related events."""
+    dispatcher = state.consumer.event_dispatcher
+    if dispatcher.groups and 'task' not in dispatcher.groups:
+        dispatcher.groups.add('task')
+        logger.info('Events of group {task} enabled by remote.')
+        return ok('task events enabled')
+    return ok('task events already enabled')
+
+
+@control_command()
+def disable_events(state):
+    """Tell worker(s) to stop sending task-related events."""
+    dispatcher = state.consumer.event_dispatcher
+    if 'task' in dispatcher.groups:
+        dispatcher.groups.discard('task')
+        logger.info('Events of group {task} disabled by remote.')
+        return ok('task events disabled')
+    return ok('task events already disabled')
+
+
+@control_command()
+def heartbeat(state):
+    """Tell worker(s) to send event heartbeat immediately."""
+    logger.debug('Heartbeat requested by remote.')
+    dispatcher = state.consumer.event_dispatcher
+    dispatcher.send('worker-heartbeat', freq=5, **worker_state.SOFTWARE_INFO)
+
+
+# -- Worker
+
+@inspect_command(visible=False)
+def hello(state, from_node, revoked=None, **kwargs):
+    """Request mingle sync-data."""
+    # pylint: disable=redefined-outer-name
+    # XXX Note that this redefines `revoked`:
+    #     Outside of this scope that is a function.
+    if from_node != state.hostname:
+        logger.info('sync with %s', from_node)
+        if revoked:
+            worker_state.revoked.update(revoked)
+        return {
+            'revoked': worker_state.revoked._data,
+            'clock': state.app.clock.forward(),
+        }
+
+
+@inspect_command(default_timeout=0.2)
+def ping(state, **kwargs):
+    """Ping worker(s)."""
+    return ok('pong')
+
+
+@inspect_command()
+def stats(state, **kwargs):
+    """Request worker statistics/information."""
+    return state.consumer.controller.stats()
+
+
+@inspect_command(alias='dump_schedule')
+def scheduled(state, **kwargs):
+    """List of currently scheduled ETA/countdown tasks."""
+    return list(_iter_schedule_requests(state.consumer.timer))
+
+
+def _iter_schedule_requests(timer):
+    for waiting in timer.schedule.queue:
+        try:
+            arg0 = waiting.entry.args[0]
+        except (IndexError, TypeError):
+            continue
+        else:
+            if isinstance(arg0, Request):
+                yield {
+                    'eta': arg0.eta.isoformat() if arg0.eta else None,
+                    'priority': waiting.priority,
+                    'request': arg0.info(),
+                }
+
+
+@inspect_command(alias='dump_reserved')
+def reserved(state, **kwargs):
+    """List of currently reserved tasks, not including scheduled/active."""
+    reserved_tasks = (
+        state.tset(worker_state.reserved_requests) -
+        state.tset(worker_state.active_requests)
+    )
+    if not reserved_tasks:
         return []
-
-    def prepare_entries():
-        for entry in schedule.info():
-            item = entry['item']
-            if item.args and isinstance(item.args[0], Request):
-                yield {'eta': entry['eta'],
-                       'priority': entry['priority'],
-                       'request': item.args[0].info(safe=safe)}
-    return list(prepare_entries())
+    return [request.info() for request in reserved_tasks]
 
 
-@Panel.register
-def dump_reserved(panel, safe=False, **kwargs):
-    reserved = state.reserved_requests - state.active_requests
-    if not reserved:
-        logger.debug('--Empty queue--')
-        return []
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug('* Dump of currently reserved tasks:\n%s',
-                     '\n'.join(safe_repr(id) for id in reserved))
-    return [request.info(safe=safe) for request in reserved]
+@inspect_command(alias='dump_active')
+def active(state, **kwargs):
+    """List of tasks currently being executed."""
+    return [request.info()
+            for request in state.tset(worker_state.active_requests)]
 
 
-@Panel.register
-def dump_active(panel, safe=False, **kwargs):
-    return [request.info(safe=safe) for request in state.active_requests]
+@inspect_command(alias='dump_revoked')
+def revoked(state, **kwargs):
+    """List of revoked task-ids."""
+    return list(worker_state.revoked)
 
 
-@Panel.register
-def stats(panel, **kwargs):
-    return panel.consumer.controller.stats()
+@inspect_command(
+    alias='dump_tasks',
+    variadic='taskinfoitems',
+    signature='[attr1 [attr2 [... [attrN]]]]',
+)
+def registered(state, taskinfoitems=None, builtins=False, **kwargs):
+    """List of registered tasks.
 
-
-@Panel.register
-def clock(panel, **kwargs):
-    return {'clock': panel.app.clock.value}
-
-
-@Panel.register
-def dump_revoked(panel, **kwargs):
-    return list(state.revoked)
-
-
-@Panel.register
-def hello(panel, **kwargs):
-    return {'revoked': state.revoked._data, 'clock': panel.app.clock.forward()}
-
-
-@Panel.register
-def dump_tasks(panel, taskinfoitems=None, **kwargs):
-    tasks = panel.app.tasks
+    Arguments:
+        taskinfoitems (Sequence[str]): List of task attributes to include.
+            Defaults to ``exchange,routing_key,rate_limit``.
+        builtins (bool): Also include built-in tasks.
+    """
+    reg = state.app.tasks
     taskinfoitems = taskinfoitems or DEFAULT_TASK_INFO_ITEMS
 
+    tasks = reg if builtins else (
+        task for task in reg if not task.startswith('celery.'))
+
     def _extract_info(task):
-        fields = dict((field, str(getattr(task, field, None)))
-                      for field in taskinfoitems
-                      if getattr(task, field, None) is not None)
+        fields = {
+            field: str(getattr(task, field, None)) for field in taskinfoitems
+            if getattr(task, field, None) is not None
+        }
         if fields:
             info = ['='.join(f) for f in items(fields)]
             return '{0} [{1}]'.format(task.name, ' '.join(info))
         return task.name
 
-    return [_extract_info(tasks[task]) for task in sorted(tasks)]
+    return [_extract_info(reg[task]) for task in sorted(tasks)]
 
 
-@Panel.register
-def ping(panel, **kwargs):
-    return {'ok': 'pong'}
+# -- Debugging
+
+@inspect_command(
+    default_timeout=60.0,
+    args=[('type', text_t), ('num', int), ('max_depth', int)],
+    signature='[object_type=Request] [num=200 [max_depth=10]]',
+)
+def objgraph(state, num=200, max_depth=10, type='Request'):  # pragma: no cover
+    """Create graph of uncollected objects (memory-leak debugging).
+
+    Arguments:
+        num (int): Max number of objects to graph.
+        max_depth (int): Traverse at most n levels deep.
+        type (str): Name of object to graph.  Default is ``"Request"``.
+    """
+    try:
+        import objgraph as _objgraph
+    except ImportError:
+        raise ImportError('Requires the objgraph library')
+    logger.info('Dumping graph for type %r', type)
+    with tempfile.NamedTemporaryFile(prefix='cobjg',
+                                     suffix='.png', delete=False) as fh:
+        objects = _objgraph.by_type(type)[:num]
+        _objgraph.show_backrefs(
+            objects,
+            max_depth=max_depth, highlight=lambda v: v in objects,
+            filename=fh.name,
+        )
+        return {'filename': fh.name}
 
 
-@Panel.register
-def pool_grow(panel, n=1, **kwargs):
-    if panel.consumer.controller.autoscaler:
-        panel.consumer.controller.autoscaler.force_scale_up(n)
+@inspect_command()
+def memsample(state, **kwargs):
+    """Sample current RSS memory usage."""
+    from celery.utils.debug import sample_mem
+    return sample_mem()
+
+
+@inspect_command(
+    args=[('samples', int)],
+    signature='[n_samples=10]',
+)
+def memdump(state, samples=10, **kwargs):  # pragma: no cover
+    """Dump statistics of previous memsample requests."""
+    from celery.utils import debug
+    out = io.StringIO()
+    debug.memdump(file=out)
+    return out.getvalue()
+
+# -- Pool
+
+
+@control_command(
+    args=[('n', int)],
+    signature='[N=1]',
+)
+def pool_grow(state, n=1, **kwargs):
+    """Grow pool by n processes/threads."""
+    if state.consumer.controller.autoscaler:
+        state.consumer.controller.autoscaler.force_scale_up(n)
     else:
-        panel.consumer.pool.grow(n)
-    return {'ok': 'spawned worker processes'}
+        state.consumer.pool.grow(n)
+        state.consumer._update_prefetch_count(n)
+    return ok('pool will grow')
 
 
-@Panel.register
-def pool_shrink(panel, n=1, **kwargs):
-    if panel.consumer.controller.autoscaler:
-        panel.consumer.controller.autoscaler.force_scale_down(n)
+@control_command(
+    args=[('n', int)],
+    signature='[N=1]',
+)
+def pool_shrink(state, n=1, **kwargs):
+    """Shrink pool by n processes/threads."""
+    if state.consumer.controller.autoscaler:
+        state.consumer.controller.autoscaler.force_scale_down(n)
     else:
-        panel.consumer.pool.shrink(n)
-    return {'ok': 'terminated worker processes'}
+        state.consumer.pool.shrink(n)
+        state.consumer._update_prefetch_count(-n)
+    return ok('pool will shrink')
 
 
-@Panel.register
-def pool_restart(panel, modules=None, reload=False, reloader=None, **kwargs):
-    if panel.app.conf.CELERYD_POOL_RESTARTS:
-        panel.consumer.controller.reload(modules, reload, reloader=reloader)
-        return {'ok': 'reload started'}
+@control_command()
+def pool_restart(state, modules=None, reload=False, reloader=None, **kwargs):
+    """Restart execution pool."""
+    if state.app.conf.worker_pool_restarts:
+        state.consumer.controller.reload(modules, reload, reloader=reloader)
+        return ok('reload started')
     else:
         raise ValueError('Pool restarts not enabled')
 
 
-@Panel.register
-def autoscale(panel, max=None, min=None):
-    autoscaler = panel.consumer.controller.autoscaler
+@control_command(
+    args=[('max', int), ('min', int)],
+    signature='[max [min]]',
+)
+def autoscale(state, max=None, min=None):
+    """Modify autoscale settings."""
+    autoscaler = state.consumer.controller.autoscaler
     if autoscaler:
         max_, min_ = autoscaler.update(max, min)
-        return {'ok': 'autoscale now min={0} max={1}'.format(max_, min_)}
+        return ok('autoscale now max={0} min={1}'.format(max_, min_))
     raise ValueError('Autoscale not enabled')
 
 
-@Panel.register
-def shutdown(panel, msg='Got shutdown from remote', **kwargs):
+@control_command()
+def shutdown(state, msg='Got shutdown from remote', **kwargs):
+    """Shutdown worker(s)."""
     logger.warning(msg)
-    raise SystemExit(msg)
+    raise WorkerShutdown(msg)
 
 
-@Panel.register
-def add_consumer(panel, queue, exchange=None, exchange_type=None,
+# -- Queues
+
+@control_command(
+    args=[
+        ('queue', text_t),
+        ('exchange', text_t),
+        ('exchange_type', text_t),
+        ('routing_key', text_t),
+    ],
+    signature='<queue> [exchange [type [routing_key]]]',
+)
+def add_consumer(state, queue, exchange=None, exchange_type=None,
                  routing_key=None, **options):
-    panel.consumer.add_task_queue(queue, exchange, exchange_type,
-                                  routing_key, **options)
-    return {'ok': 'add consumer {0}'.format(queue)}
+    """Tell worker(s) to consume from task queue by name."""
+    state.consumer.call_soon(
+        state.consumer.add_task_queue,
+        queue, exchange, exchange_type or 'direct', routing_key, **options)
+    return ok('add consumer {0}'.format(queue))
 
 
-@Panel.register
-def cancel_consumer(panel, queue=None, **_):
-    panel.consumer.cancel_task_queue(queue)
-    return {'ok': 'no longer consuming from {0}'.format(queue)}
+@control_command(
+    args=[('queue', text_t)],
+    signature='<queue>',
+)
+def cancel_consumer(state, queue, **_):
+    """Tell worker(s) to stop consuming from task queue by name."""
+    state.consumer.call_soon(
+        state.consumer.cancel_task_queue, queue,
+    )
+    return ok('no longer consuming from {0}'.format(queue))
 
 
-@Panel.register
-def active_queues(panel):
-    """Returns the queues associated with each worker."""
-    return [dict(queue.as_dict(recurse=True))
-            for queue in panel.consumer.task_consumer.queues]
-
-
-@Panel.register
-def dump_conf(panel, **kwargs):
-    return jsonify(dict(panel.app.conf))
-
-
-@Panel.register
-def election(panel, id, topic, action=None, **kwargs):
-    panel.consumer.gossip.election(id, topic, action)
+@inspect_command()
+def active_queues(state):
+    """List the task queues a worker is currently consuming from."""
+    if state.consumer.task_consumer:
+        return [dict(queue.as_dict(recurse=True))
+                for queue in state.consumer.task_consumer.queues]
+    return []

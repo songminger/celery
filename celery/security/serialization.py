@@ -1,48 +1,38 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.security.serialization
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""Secure serializer."""
+from __future__ import absolute_import, unicode_literals
 
-    Secure serializer.
+from kombu.serialization import dumps, loads, registry
+from kombu.utils.encoding import bytes_to_str, ensure_bytes, str_to_bytes
 
-"""
-from __future__ import absolute_import
-
-import base64
-
-from kombu.serialization import registry, encode, decode
-from kombu.utils.encoding import bytes_to_str, str_to_bytes, ensure_bytes
+from celery.app.defaults import DEFAULT_SECURITY_DIGEST
+from celery.utils.serialization import b64decode, b64encode
 
 from .certificate import Certificate, FSCertStore
 from .key import PrivateKey
-from .utils import reraise_errors
+from .utils import get_digest_algorithm, reraise_errors
 
-
-def b64encode(s):
-    return bytes_to_str(base64.b64encode(str_to_bytes(s)))
-
-
-def b64decode(s):
-    return base64.b64decode(str_to_bytes(s))
+__all__ = ('SecureSerializer', 'register_auth')
 
 
 class SecureSerializer(object):
+    """Signed serializer."""
 
     def __init__(self, key=None, cert=None, cert_store=None,
-                 digest='sha1', serializer='json'):
+                 digest=DEFAULT_SECURITY_DIGEST, serializer='json'):
         self._key = key
         self._cert = cert
         self._cert_store = cert_store
-        self._digest = digest
+        self._digest = get_digest_algorithm(digest)
         self._serializer = serializer
 
     def serialize(self, data):
-        """serialize data structure into string"""
+        """Serialize data structure into string."""
         assert self._key is not None
         assert self._cert is not None
-        with reraise_errors('Unable to serialize: {0!r}', (Exception, )):
-            content_type, content_encoding, body = encode(
-                data, serializer=self._serializer)
+        with reraise_errors('Unable to serialize: {0!r}', (Exception,)):
+            content_type, content_encoding, body = dumps(
+                bytes_to_str(data), serializer=self._serializer)
             # What we sign is the serialized body, not the body itself.
             # this way the receiver doesn't have to decode the contents
             # to verify the signature (and thus avoiding potential flaws
@@ -53,16 +43,16 @@ class SecureSerializer(object):
                               signer=self._cert.get_id())
 
     def deserialize(self, data):
-        """deserialize data structure from string"""
+        """Deserialize data structure from string."""
         assert self._cert_store is not None
-        with reraise_errors('Unable to deserialize: {0!r}', (Exception, )):
+        with reraise_errors('Unable to deserialize: {0!r}', (Exception,)):
             payload = self._unpack(data)
             signature, signer, body = (payload['signature'],
                                        payload['signer'],
                                        payload['body'])
             self._cert_store[signer].verify(body, signature, self._digest)
-        return decode(bytes_to_str(body), payload['content_type'],
-                      payload['content_encoding'], force=True)
+        return loads(bytes_to_str(body), payload['content_type'],
+                     payload['content_encoding'], force=True)
 
     def _pack(self, body, content_type, content_encoding, signer, signature,
               sep=str_to_bytes('\x00\x01')):
@@ -79,33 +69,36 @@ class SecureSerializer(object):
         signer = raw_payload[:first_sep]
         signer_cert = self._cert_store[signer]
 
-        sig_len = signer_cert._cert.get_pubkey().bits() >> 3
+        # shift 3 bits right to get signature length
+        # 2048bit rsa key has a signature length of 256
+        # 4096bit rsa key has a signature length of 512
+        sig_len = signer_cert.get_pubkey().key_size >> 3
+        sep_len = len(sep)
+        signature_start_position = first_sep + sep_len
+        signature_end_position = signature_start_position + sig_len
         signature = raw_payload[
-            first_sep + len(sep):first_sep + len(sep) + sig_len
+            signature_start_position:signature_end_position
         ]
-        end_of_sig = first_sep + len(sep) + sig_len+len(sep)
 
-        v = raw_payload[end_of_sig:].split(sep)
-
-        values = [bytes_to_str(signer), bytes_to_str(signature),
-                  bytes_to_str(v[0]), bytes_to_str(v[1]), bytes_to_str(v[2])]
+        v = raw_payload[signature_end_position + sep_len:].split(sep)
 
         return {
-            'signer': values[0],
-            'signature': values[1],
-            'content_type': values[2],
-            'content_encoding': values[3],
-            'body': values[4],
+            'signer': signer,
+            'signature': signature,
+            'content_type': bytes_to_str(v[0]),
+            'content_encoding': bytes_to_str(v[1]),
+            'body': bytes_to_str(v[2]),
         }
 
 
-def register_auth(key=None, cert=None, store=None, digest='sha1',
+def register_auth(key=None, cert=None, store=None,
+                  digest=DEFAULT_SECURITY_DIGEST,
                   serializer='json'):
-    """register security serializer"""
+    """Register security serializer."""
     s = SecureSerializer(key and PrivateKey(key),
                          cert and Certificate(cert),
                          store and FSCertStore(store),
-                         digest=digest, serializer=serializer)
+                         digest, serializer=serializer)
     registry.register('auth', s.serialize, s.deserialize,
                       content_type='application/data',
                       content_encoding='utf-8')

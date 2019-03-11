@@ -1,18 +1,23 @@
-from __future__ import absolute_import
+"""Django-specific customization."""
+from __future__ import absolute_import, unicode_literals
 
 import os
 import sys
 import warnings
-
 from datetime import datetime
+from importlib import import_module
 
-from celery import signals
-from celery.exceptions import FixupWarning
+from kombu.utils.imports import symbol_by_name
+from kombu.utils.objects import cached_property
 
-SETTINGS_MODULE = os.environ.get('DJANGO_SETTINGS_MODULE')
+from celery import _state, signals
+from celery.exceptions import FixupWarning, ImproperlyConfigured
+
+__all__ = ('DjangoFixup', 'fixup')
+
 ERR_NOT_INSTALLED = """\
 Environment variable DJANGO_SETTINGS_MODULE is defined
-but Django is not installed.  Will not apply Django fixups!
+but Django isn't installed.  Won't apply Django fix-ups!
 """
 
 
@@ -24,108 +29,116 @@ def _maybe_close_fd(fh):
         pass
 
 
-def fixup(app):
-    if SETTINGS_MODULE:
+def _verify_django_version(django):
+    if django.VERSION < (1, 11):
+        raise ImproperlyConfigured('Celery 4.x requires Django 1.11 or later.')
+
+
+def fixup(app, env='DJANGO_SETTINGS_MODULE'):
+    """Install Django fixup if settings module environment is set."""
+    SETTINGS_MODULE = os.environ.get(env)
+    if SETTINGS_MODULE and 'django' not in app.loader_cls.lower():
         try:
             import django  # noqa
         except ImportError:
             warnings.warn(FixupWarning(ERR_NOT_INSTALLED))
-        return DjangoFixup(app).install()
+        else:
+            _verify_django_version(django)
+            return DjangoFixup(app).install()
 
 
 class DjangoFixup(object):
-    _db_recycles = 0
+    """Fixup installed when using Django."""
 
     def __init__(self, app):
-        from django import db
-        from django.core import cache
-        from django.conf import settings
-        from django.core.mail import mail_admins
-
-        # Current time and date
-        try:
-            from django.utils.timezone import now
-        except ImportError:  # pre django-1.4
-            now = datetime.now  # noqa
-
-        # Database-related exceptions.
-        from django.db import DatabaseError
-        try:
-            import MySQLdb as mysql
-            _my_database_errors = (mysql.DatabaseError,
-                                   mysql.InterfaceError,
-                                   mysql.OperationalError)
-        except ImportError:
-            _my_database_errors = ()      # noqa
-        try:
-            import psycopg2 as pg
-            _pg_database_errors = (pg.DatabaseError,
-                                   pg.InterfaceError,
-                                   pg.OperationalError)
-        except ImportError:
-            _pg_database_errors = ()      # noqa
-        try:
-            import sqlite3
-            _lite_database_errors = (sqlite3.DatabaseError,
-                                     sqlite3.InterfaceError,
-                                     sqlite3.OperationalError)
-        except ImportError:
-            _lite_database_errors = ()    # noqa
-        try:
-            import cx_Oracle as oracle
-            _oracle_database_errors = (oracle.DatabaseError,
-                                       oracle.InterfaceError,
-                                       oracle.OperationalError)
-        except ImportError:
-            _oracle_database_errors = ()  # noqa
-
         self.app = app
-        self.db_reuse_max = self.app.conf.get('CELERY_DB_REUSE_MAX', None)
-        self._cache = cache
-        self._settings = settings
-        self._db = db
-        self._mail_admins = mail_admins
-        self._now = now
-        self.database_errors = (
-            (DatabaseError, ) +
-            _my_database_errors +
-            _pg_database_errors +
-            _lite_database_errors +
-            _oracle_database_errors,
-        )
+        if _state.default_app is None:
+            self.app.set_default()
+        self._worker_fixup = None
 
     def install(self):
-        # Need to add project directory to path
-        sys.path.append(os.getcwd())
-        signals.beat_embedded_init.connect(self.close_database)
-        signals.worker_ready.connect(self.on_worker_ready)
-        signals.task_prerun.connect(self.on_task_prerun)
-        signals.task_postrun.connect(self.on_task_postrun)
-        signals.worker_init.connect(self.on_worker_init)
-        signals.worker_process_init.connect(self.on_worker_process_init)
+        # Need to add project directory to path.
+        # The project directory has precedence over system modules,
+        # so we prepend it to the path.
+        sys.path.insert(0, os.getcwd())
 
+        self._settings = symbol_by_name('django.conf:settings')
         self.app.loader.now = self.now
-        self.app.loader.mail_admins = self.mail_admins
 
+        signals.import_modules.connect(self.on_import_modules)
+        signals.worker_init.connect(self.on_worker_init)
         return self
+
+    @property
+    def worker_fixup(self):
+        if self._worker_fixup is None:
+            self._worker_fixup = DjangoWorkerFixup(self.app)
+        return self._worker_fixup
+
+    @worker_fixup.setter
+    def worker_fixup(self, value):
+        self._worker_fixup = value
+
+    def on_import_modules(self, **kwargs):
+        # call django.setup() before task modules are imported
+        self.worker_fixup.validate_models()
+
+    def on_worker_init(self, **kwargs):
+        self.worker_fixup.install()
 
     def now(self, utc=False):
         return datetime.utcnow() if utc else self._now()
 
-    def mail_admins(self, subject, body, fail_silently=False, **kwargs):
-        return self._mail_admins(subject, body, fail_silently=fail_silently)
+    def autodiscover_tasks(self):
+        from django.apps import apps
+        return [config.name for config in apps.get_app_configs()]
 
-    def on_worker_init(self, **kwargs):
-        """Called when the worker starts.
+    @cached_property
+    def _now(self):
+        return symbol_by_name('django.utils.timezone:now')
 
-        Automatically discovers any ``tasks.py`` files in the applications
-        listed in ``INSTALLED_APPS``.
 
-        """
+class DjangoWorkerFixup(object):
+    _db_recycles = 0
+
+    def __init__(self, app):
+        self.app = app
+        self.db_reuse_max = self.app.conf.get('CELERY_DB_REUSE_MAX', None)
+        self._db = import_module('django.db')
+        self._cache = import_module('django.core.cache')
+        self._settings = symbol_by_name('django.conf:settings')
+
+        self.interface_errors = (
+            symbol_by_name('django.db.utils.InterfaceError'),
+        )
+        self.DatabaseError = symbol_by_name('django.db:DatabaseError')
+
+    def django_setup(self):
+        import django
+        django.setup()
+
+    def validate_models(self):
+        from django.core.checks import run_checks
+        self.django_setup()
+        run_checks()
+
+    def install(self):
+        signals.beat_embedded_init.connect(self.close_database)
+        signals.worker_ready.connect(self.on_worker_ready)
+        signals.task_prerun.connect(self.on_task_prerun)
+        signals.task_postrun.connect(self.on_task_postrun)
+        signals.worker_process_init.connect(self.on_worker_process_init)
         self.close_database()
         self.close_cache()
+        return self
 
     def on_worker_process_init(self, **kwargs):
+        # Child process must validate models again if on Windows,
+        # or if they were started using execv.
+        if os.environ.get('FORKED_BY_MULTIPROCESSING'):
+            self.validate_models()
+
+        # close connections:
         # the parent process may have established these,
         # so need to close them.
 
@@ -133,32 +146,31 @@ class DjangoFixup(object):
         # the inherited DB conn to also get broken in the parent
         # process so we need to remove it without triggering any
         # network IO that close() might cause.
-        try:
-            for c in self._db.connections.all():
-                if c and c.connection:
-                    _maybe_close_fd(c.connection)
-        except AttributeError:
-            if self._db.connection and self._db.connection.connection:
-                _maybe_close_fd(self._db.connection.connection)
+        for c in self._db.connections.all():
+            if c and c.connection:
+                self._maybe_close_db_fd(c.connection)
 
         # use the _ version to avoid DB_REUSE preventing the conn.close() call
         self._close_database()
         self.close_cache()
+
+    def _maybe_close_db_fd(self, fd):
+        try:
+            _maybe_close_fd(fd)
+        except self.interface_errors:
+            pass
 
     def on_task_prerun(self, sender, **kwargs):
         """Called before every task."""
         if not getattr(sender.request, 'is_eager', False):
             self.close_database()
 
-    def on_task_postrun(self, **kwargs):
-        """Does everything necessary for Django to work in a long-living,
-        multiprocessing environment.
-
-        """
-        # See http://groups.google.com/group/django-users/
+    def on_task_postrun(self, sender, **kwargs):
+        # See https://groups.google.com/group/django-users/
         #            browse_thread/thread/78200863d0c07c6d/
-        self.close_database()
-        self.close_cache()
+        if not getattr(sender.request, 'is_eager', False):
+            self.close_database()
+            self.close_cache()
 
     def close_database(self, **kwargs):
         if not self.db_reuse_max:
@@ -169,22 +181,19 @@ class DjangoFixup(object):
         self._db_recycles += 1
 
     def _close_database(self):
-        try:
-            funs = [conn.close for conn in self._db.connections]
-        except AttributeError:
-            funs = [self._db.close_connection]  # pre multidb
-
-        for close in funs:
+        for conn in self._db.connections.all():
             try:
-                close()
-            except self.database_errors as exc:
+                conn.close_if_unusable_or_obsolete()
+            except self.interface_errors:
+                pass
+            except self.DatabaseError as exc:
                 str_exc = str(exc)
                 if 'closed' not in str_exc and 'not connected' not in str_exc:
                     raise
 
     def close_cache(self):
         try:
-            self._cache.cache.close()
+            self._cache.close_caches()
         except (TypeError, AttributeError):
             pass
 

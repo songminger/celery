@@ -8,15 +8,15 @@ Contents
 ``proj/``
 ---------
 
-This is the project iself, created using
+This is a project in itself, created using
 ``django-admin.py startproject proj``, and then the settings module
-(``proj/settings.py``) was modified to add ``tasks`` and ``demoapp`` to
+(``proj/settings.py``) was modified to add ``demoapp`` to
 ``INSTALLED_APPS``
 
-``tasks/``
+``proj/celery.py``
 ----------
 
-This app contains the Celery application instance for this project,
+This module contains the Celery application instance for this project,
 we take configuration from Django settings and use ``autodiscover_tasks`` to
 find task modules inside all packages listed in ``INSTALLED_APPS``.
 
@@ -24,16 +24,37 @@ find task modules inside all packages listed in ``INSTALLED_APPS``.
 ------------
 
 Example generic app.  This is decoupled from the rest of the project by using
-the ``@shared_task`` decorator.  Shared tasks are shared between all Celery
-instances.
+the ``@shared_task`` decorator.  This decorator returns a proxy that always
+points to the currently active Celery instance.
 
+Installing requirements
+=======================
+
+The settings file assumes that ``rabbitmq-server`` is running on ``localhost``
+using the default ports. More information here:
+
+http://docs.celeryproject.org/en/latest/getting-started/brokers/rabbitmq.html
+
+In addition, some Python requirements must also be satisfied:
+
+.. code-block:: console
+
+    $ pip install -r requirements.txt
 
 Starting the worker
 ===================
 
-The ``DJANGO_SETTINGS_MODULE`` environment must be set when starting the
-worker:
+.. code-block:: console
 
-.. code-block:: bash
+    $ celery -A proj worker -l info
 
-    $ DJANGO_SETTINGS_MODULE='proj.settings' celery -A tasks worker -l info
+Running a task
+===================
+
+.. code-block:: console
+
+    $ python ./manage.py shell
+    >>> from demoapp.tasks import add, mul, xsum
+    >>> res = add.delay(2,3)
+    >>> res.get()
+    5

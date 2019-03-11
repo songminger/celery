@@ -1,87 +1,77 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.security
-    ~~~~~~~~~~~~~~~
+"""Message Signing Serializer."""
+from __future__ import absolute_import, unicode_literals
 
-    Module implementing the signing message serializer.
-
-"""
-from __future__ import absolute_import
-
-from kombu.serialization import registry
-
-from celery import current_app
+from kombu.serialization import (
+    registry, disable_insecure_serializers as _disable_insecure_serializers,
+)
 from celery.exceptions import ImproperlyConfigured
 
-from .serialization import register_auth
 
-SSL_NOT_INSTALLED = """\
-You need to install the pyOpenSSL library to use the auth serializer.
+CRYPTOGRAPHY_NOT_INSTALLED = """\
+You need to install the cryptography library to use the auth serializer.
 Please install by:
 
-    $ pip install pyOpenSSL
+    $ pip install cryptography
 """
 
-SETTING_MISSING = """\
+SECURITY_SETTING_MISSING = """\
 Sorry, but you have to configure the
-    * CELERY_SECURITY_KEY
-    * CELERY_SECURITY_CERTIFICATE, and the
-    * CELERY_SECURITY_CERT_STORE
+    * security_key
+    * security_certificate, and the
+    * security_cert_store
 configuration settings to use the auth serializer.
 
 Please see the configuration reference for more information.
 """
 
+SETTING_MISSING = """\
+You have to configure a special task serializer
+for signing and verifying tasks:
+    * task_serializer = 'auth'
 
-def disable_untrusted_serializers(whitelist=None):
-    for name in set(registry._decoders) - set(whitelist or []):
-        registry.disable(name)
+You have to accept only tasks which are serialized with 'auth'.
+There is no point in signing messages if they are not verified.
+    * accept_content = ['auth']
+"""
+
+__all__ = ('setup_security',)
+
+try:
+    import cryptography  # noqa
+except ImportError:
+    raise ImproperlyConfigured(CRYPTOGRAPHY_NOT_INSTALLED)
+
+from .serialization import register_auth  # noqa: need cryptography first
 
 
 def setup_security(allowed_serializers=None, key=None, cert=None, store=None,
-                   digest='sha1', serializer='json'):
-    """Setup the message-signing serializer.
+                   digest=None, serializer='json', app=None):
+    """See :meth:`@Celery.setup_security`."""
+    if app is None:
+        from celery import current_app
+        app = current_app._get_current_object()
 
-    Disables untrusted serializers and if configured to use the ``auth``
-    serializer will register the auth serializer with the provided settings
-    into the Kombu serializer registry.
+    _disable_insecure_serializers(allowed_serializers)
 
-    :keyword allowed_serializers:  List of serializer names, or content_types
-        that should be exempt from being disabled.
-    :keyword key: Name of private key file to use.
-        Defaults to the :setting:`CELERY_SECURITY_KEY` setting.
-    :keyword cert: Name of certificate file to use.
-        Defaults to the :setting:`CELERY_SECURITY_CERTIFICATE` setting.
-    :keyword store: Directory containing certificates.
-        Defaults to the :setting:`CELERY_SECURITY_CERT_STORE` setting.
-    :keyword digest: Digest algorithm used when signing messages.
-        Default is ``sha1``.
-    :keyword serializer: Serializer used to encode messages after
-        they have been signed.  See :setting:`CELERY_TASK_SERIALIZER` for
-        the serializers supported.
-        Default is ``json``.
-
-    """
-
-    disable_untrusted_serializers(allowed_serializers)
-
-    conf = current_app.conf
-    if conf.CELERY_TASK_SERIALIZER != 'auth':
-        return
-
-    try:
-        from OpenSSL import crypto  # noqa
-    except ImportError:
-        raise ImproperlyConfigured(SSL_NOT_INSTALLED)
-
-    key = key or conf.CELERY_SECURITY_KEY
-    cert = cert or conf.CELERY_SECURITY_CERTIFICATE
-    store = store or conf.CELERY_SECURITY_CERT_STORE
-
-    if not (key and cert and store):
+    # check conf for sane security settings
+    conf = app.conf
+    if conf.task_serializer != 'auth' or conf.accept_content != ['auth']:
         raise ImproperlyConfigured(SETTING_MISSING)
 
-    with open(key) as kf:
-        with open(cert) as cf:
+    key = key or conf.security_key
+    cert = cert or conf.security_certificate
+    store = store or conf.security_cert_store
+    digest = digest or conf.security_digest
+
+    if not (key and cert and store):
+        raise ImproperlyConfigured(SECURITY_SETTING_MISSING)
+
+    with open(key, 'r') as kf:
+        with open(cert, 'r') as cf:
             register_auth(kf.read(), cf.read(), store, digest, serializer)
     registry._set_default_serializer('auth')
+
+
+def disable_untrusted_serializers(whitelist=None):
+    _disable_insecure_serializers(allowed=whitelist)

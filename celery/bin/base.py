@@ -1,93 +1,44 @@
 # -*- coding: utf-8 -*-
-"""
+"""Base command-line interface."""
+from __future__ import absolute_import, print_function, unicode_literals
 
-.. _preload-options:
-
-Preload Options
----------------
-
-These options are supported by all commands,
-and usually parsed before command-specific arguments.
-
-.. cmdoption:: -A, --app
-
-    app instance to use (e.g. module.attr_name)
-
-.. cmdoption:: -b, --broker
-
-    url to broker.  default is 'amqp://guest@localhost//'
-
-.. cmdoption:: --loader
-
-    name of custom loader class to use.
-
-.. cmdoption:: --config
-
-    Name of the configuration module
-
-.. _daemon-options:
-
-Daemon Options
---------------
-
-These options are supported by commands that can detach
-into the background (daemon).  They will be present
-in any command that also has a `--detach` option.
-
-.. cmdoption:: -f, --logfile
-
-    Path to log file. If no logfile is specified, `stderr` is used.
-
-.. cmdoption:: --pidfile
-
-    Optional file used to store the process pid.
-
-    The program will not start if this file already exists
-    and the pid is still alive.
-
-.. cmdoption:: --uid
-
-    User id, or user name of the user to run as after detaching.
-
-.. cmdoption:: --gid
-
-    Group id, or group name of the main group to change to after
-    detaching.
-
-.. cmdoption:: --umask
-
-    Effective umask of the process after detaching. Default is 0.
-
-.. cmdoption:: --workdir
-
-    Optional directory to change to after detaching.
-
-"""
-from __future__ import absolute_import, print_function
-
+import argparse
+import json
 import os
+import random
 import re
-import socket
 import sys
 import warnings
-
 from collections import defaultdict
 from heapq import heappush
-from inspect import getargspec
-from optparse import OptionParser, IndentedHelpFormatter, make_option as Option
 from pprint import pformat
-from types import ModuleType
 
-import celery
+from celery import VERSION_BANNER, Celery, maybe_patch_concurrency, signals
 from celery.exceptions import CDeprecationWarning, CPendingDeprecationWarning
-from celery.five import items, string, string_t, values
-from celery.platforms import (
-    EX_FAILURE, EX_OK, EX_USAGE,
-    maybe_patch_concurrency,
+from celery.five import (getfullargspec, items, long_t,
+                         python_2_unicode_compatible, string, string_t,
+                         text_t)
+from celery.platforms import EX_FAILURE, EX_OK, EX_USAGE, isatty
+from celery.utils import imports, term, text
+from celery.utils.functional import dictfilter
+from celery.utils.nodenames import host_format, node_format
+from celery.utils.objects import Bunch
+
+# Option is here for backwards compatiblity, as third-party commands
+# may import it from here.
+try:
+    from optparse import Option  # pylint: disable=deprecated-module
+except ImportError:  # pragma: no cover
+    Option = None  # noqa
+
+try:
+    input = raw_input
+except NameError:  # pragma: no cover
+    pass
+
+__all__ = (
+    'Error', 'UsageError', 'Extensions', 'Command', 'Option', 'daemon_options',
 )
-from celery.utils import term
-from celery.utils import text
-from celery.utils.imports import symbol_by_name, import_from_cwd
 
 # always enable DeprecationWarnings, so our users can see them.
 for warning in (CDeprecationWarning, CPendingDeprecationWarning):
@@ -99,12 +50,71 @@ Unrecognized command-line arguments: {0}
 Try --help?
 """
 
+UNABLE_TO_LOAD_APP_MODULE_NOT_FOUND = """
+Unable to load celery application.
+The module {0} was not found.
+"""
+
+UNABLE_TO_LOAD_APP_APP_MISSING = """
+Unable to load celery application.
+{0}
+"""
+
 find_long_opt = re.compile(r'.+?(--.+?)(?:\s|,|$)')
 find_rst_ref = re.compile(r':\w+:`(.+?)`')
-find_sformat = re.compile(r'%(\w)')
+find_rst_decl = re.compile(r'^\s*\.\. .+?::.+$')
 
 
+def _optparse_callback_to_type(option, callback):
+    parser = Bunch(values=Bunch())
+
+    def _on_arg(value):
+        callback(option, None, value, parser)
+        return getattr(parser.values, option.dest)
+    return _on_arg
+
+
+def _add_optparse_argument(parser, opt, typemap={
+        'string': text_t,
+        'int': int,
+        'long': long_t,
+        'float': float,
+        'complex': complex,
+        'choice': None}):
+    if opt.callback:
+        opt.type = _optparse_callback_to_type(opt, opt.type)
+    # argparse checks for existence of this kwarg
+    if opt.action == 'callback':
+        opt.action = None
+    # store_true sets value to "('NO', 'DEFAULT')" for some
+    # crazy reason, so not to set a sane default here.
+    if opt.action == 'store_true' and opt.default is None:
+        opt.default = False
+    parser.add_argument(
+        *opt._long_opts + opt._short_opts,
+        **dictfilter({
+            'action': opt.action,
+            'type': typemap.get(opt.type, opt.type),
+            'dest': opt.dest,
+            'nargs': opt.nargs,
+            'choices': opt.choices,
+            'help': opt.help,
+            'metavar': opt.metavar,
+            'default': opt.default}))
+
+
+def _add_compat_options(parser, options):
+    for option in options or ():
+        if callable(option):
+            option(parser)
+        else:
+            _add_optparse_argument(parser, option)
+
+
+@python_2_unicode_compatible
 class Error(Exception):
+    """Exception raised by commands."""
+
     status = EX_FAILURE
 
     def __init__(self, reason, status=None):
@@ -114,14 +124,16 @@ class Error(Exception):
 
     def __str__(self):
         return self.reason
-    __unicode__ = __str__
 
 
 class UsageError(Error):
+    """Exception raised for malformed arguments."""
+
     status = EX_USAGE
 
 
 class Extensions(object):
+    """Loads extensions from setuptools entrypoints."""
 
     def __init__(self, namespace, register):
         self.names = []
@@ -133,58 +145,36 @@ class Extensions(object):
         self.register(cls, name=name)
 
     def load(self):
-        try:
-            from pkg_resources import iter_entry_points
-        except ImportError:
-            return
-
-        for ep in iter_entry_points(self.namespace):
-            sym = ':'.join([ep.module_name, ep.attrs[0]])
-            try:
-                cls = symbol_by_name(sym)
-            except (ImportError, SyntaxError) as exc:
-                warnings.warn(
-                    'Cannot load extension {0!r}: {1!r}'.format(sym, exc))
-            else:
-                self.add(cls, ep.name)
+        for name, cls in imports.load_extension_classes(self.namespace):
+            self.add(cls, name)
         return self.names
-
-
-class HelpFormatter(IndentedHelpFormatter):
-
-    def format_epilog(self, epilog):
-        if epilog:
-            return '\n{0}\n\n'.format(epilog)
-        return ''
-
-    def format_description(self, description):
-        return text.ensure_2lines(text.fill_paragraphs(
-            text.dedent(description), self.width))
 
 
 class Command(object):
     """Base class for command-line applications.
 
-    :keyword app: The current app.
-    :keyword get_app: Callable returning the current app if no app provided.
-
+    Arguments:
+        app (Celery): The app to use.
+        get_app (Callable): Fucntion returning the current app
+            when no app provided.
     """
+
     Error = Error
     UsageError = UsageError
-    Parser = OptionParser
+    Parser = argparse.ArgumentParser
 
     #: Arg list used in help.
     args = ''
 
     #: Application version.
-    version = celery.VERSION_BANNER
+    version = VERSION_BANNER
 
     #: If false the parser will raise an exception if positional
     #: args are provided.
     supports_args = True
 
     #: List of options (without preload options).
-    option_list = ()
+    option_list = None
 
     # module Rst documentation to parse help from (if any)
     doc = None
@@ -193,22 +183,11 @@ class Command(object):
     # (Issue #1008).
     respects_app_option = True
 
-    #: List of options to parse before parsing other options.
-    preload_options = (
-        Option('-A', '--app', default=None),
-        Option('-b', '--broker', default=None),
-        Option('--loader', default=None),
-        Option('--config', default=None),
-        Option('--workdir', default=None, dest='working_directory'),
-        Option('--no-color', '-C', action='store_true', default=None),
-        Option('--quiet', '-q', action='store_true'),
-    )
-
     #: Enable if the application should support config from the cmdline.
     enable_config_from_cmdline = False
 
-    #: Default configuration namespace.
-    namespace = 'celery'
+    #: Default configuration name-space.
+    namespace = None
 
     #: Text to print at end of --help
     epilog = None
@@ -216,15 +195,18 @@ class Command(object):
     #: Text to print in --help before option list.
     description = ''
 
-    #: Set to true if this command doesn't have subcommands
+    #: Set to true if this command doesn't have sub-commands
     leaf = True
 
-    # used by :meth:`say_remote_control_reply`.
+    # used by :meth:`say_remote_command_reply`.
     show_body = True
     # used by :meth:`say_chat`.
     show_reply = True
 
     prog_name = 'celery'
+
+    #: Name of argparse option used for parsing positional args.
+    args_name = 'args'
 
     def __init__(self, app=None, get_app=None, no_color=False,
                  stdout=None, stderr=None, quiet=False, on_error=None,
@@ -233,30 +215,34 @@ class Command(object):
         self.get_app = get_app or self._get_default_app
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
-        self.no_color = no_color
-        self.colored = term.colored(enabled=not self.no_color)
+        self._colored = None
+        self._no_color = no_color
         self.quiet = quiet
         if not self.description:
-            self.description = self.__doc__
+            self.description = self._strip_restructeredtext(self.__doc__)
         if on_error:
             self.on_error = on_error
         if on_usage_error:
             self.on_usage_error = on_usage_error
 
     def run(self, *args, **options):
-        """This is the body of the command called by :meth:`handle_argv`."""
         raise NotImplementedError('subclass responsibility')
 
     def on_error(self, exc):
+        # pylint: disable=method-hidden
+        #   on_error argument to __init__ may override this method.
         self.error(self.colored.red('Error: {0}'.format(exc)))
 
     def on_usage_error(self, exc):
+        # pylint: disable=method-hidden
+        #   on_usage_error argument to __init__ may override this method.
         self.handle_error(exc)
 
     def on_concurrency_setup(self):
         pass
 
     def __call__(self, *args, **kwargs):
+        random.seed()  # maybe we were forked.
         self.verify_args(args)
         try:
             ret = self.run(*args, **kwargs)
@@ -269,7 +255,7 @@ class Command(object):
             return exc.status
 
     def verify_args(self, given, _index=0):
-        S = getargspec(self.run)
+        S = getfullargspec(self.run)
         _index = 1 if S.args and S.args[0] == 'self' else _index
         required = S.args[_index:-len(S.defaults) if S.defaults else None]
         missing = required[len(given):]
@@ -282,9 +268,9 @@ class Command(object):
     def execute_from_commandline(self, argv=None):
         """Execute application from command-line.
 
-        :keyword argv: The list of command-line arguments.
-                       Defaults to ``sys.argv``.
-
+        Arguments:
+            argv (List[str]): The list of command-line arguments.
+                Defaults to ``sys.argv``.
         """
         if argv is None:
             argv = list(sys.argv)
@@ -294,7 +280,16 @@ class Command(object):
 
         # Dump version and exit if '--version' arg set.
         self.early_version(argv)
-        argv = self.setup_app_from_commandline(argv)
+        try:
+            argv = self.setup_app_from_commandline(argv)
+        except ModuleNotFoundError as e:
+            self.on_error(UNABLE_TO_LOAD_APP_MODULE_NOT_FOUND.format(e.name))
+            return EX_FAILURE
+        except AttributeError as e:
+            msg = e.args[0].capitalize()
+            self.on_error(UNABLE_TO_LOAD_APP_APP_MISSING.format(msg))
+            return EX_FAILURE
+
         self.prog_name = os.path.basename(argv[0])
         return self.handle_argv(self.prog_name, argv[1:])
 
@@ -307,30 +302,80 @@ class Command(object):
         pool_option = self.with_pool_option(argv)
         if pool_option:
             maybe_patch_concurrency(argv, *pool_option)
-            short_opts, long_opts = pool_option
 
     def usage(self, command):
-        return '%prog {0} [options] {self.args}'.format(command, self=self)
+        return '%(prog)s {0} [options] {self.args}'.format(command, self=self)
+
+    def add_arguments(self, parser):
+        pass
 
     def get_options(self):
-        """Get supported command-line options."""
+        # This is for optparse options, please use add_arguments.
         return self.option_list
+
+    def add_preload_arguments(self, parser):
+        group = parser.add_argument_group('Global Options')
+        group.add_argument('-A', '--app', default=None)
+        group.add_argument('-b', '--broker', default=None)
+        group.add_argument('--result-backend', default=None)
+        group.add_argument('--loader', default=None)
+        group.add_argument('--config', default=None)
+        group.add_argument('--workdir', default=None)
+        group.add_argument(
+            '--no-color', '-C', action='store_true', default=None)
+        group.add_argument('--quiet', '-q', action='store_true')
+
+    def _add_version_argument(self, parser):
+        parser.add_argument(
+            '--version', action='version', version=self.version,
+        )
+
+    def prepare_arguments(self, parser):
+        pass
 
     def expanduser(self, value):
         if isinstance(value, string_t):
             return os.path.expanduser(value)
         return value
 
+    def ask(self, q, choices, default=None):
+        """Prompt user to choose from a tuple of string values.
+
+        If a default is not specified the question will be repeated
+        until the user gives a valid choice.
+
+        Matching is case insensitive.
+
+        Arguments:
+            q (str): the question to ask (don't include questionark)
+            choice (Tuple[str]): tuple of possible choices, must be lowercase.
+            default (Any): Default value if any.
+        """
+        schoices = choices
+        if default is not None:
+            schoices = [c.upper() if c == default else c.lower()
+                        for c in choices]
+        schoices = '/'.join(schoices)
+
+        p = '{0} ({1})? '.format(q.capitalize(), schoices)
+        while 1:
+            val = input(p).lower()
+            if val in choices:
+                return val
+            elif default is not None:
+                break
+        return default
+
     def handle_argv(self, prog_name, argv, command=None):
-        """Parses command-line arguments from ``argv`` and dispatches
-        to :meth:`run`.
+        """Parse arguments from argv and dispatch to :meth:`run`.
 
-        :param prog_name: The program name (``argv[0]``).
-        :param argv: Command arguments.
+        Warning:
+            Exits with an error message if :attr:`supports_args` is disabled
+            and ``argv`` contains positional arguments.
 
-        Exits with an error message if :attr:`supports_args` is disabled
-        and ``argv`` contains positional arguments.
-
+        Arguments:
+            prog_name (str): The program name (``argv[0]``).
+            argv (List[str]): Rest of command-line arguments.
         """
         options, args = self.prepare_args(
             *self.parse_options(prog_name, argv, command))
@@ -338,9 +383,10 @@ class Command(object):
 
     def prepare_args(self, options, args):
         if options:
-            options = dict((k, self.expanduser(v))
-                           for k, v in items(vars(options))
-                           if not k.startswith('_'))
+            options = {
+                k: self.expanduser(v)
+                for k, v in items(options) if not k.startswith('_')
+            }
         args = [self.expanduser(arg) for arg in args]
         self.check_args(args)
         return options, args
@@ -369,24 +415,49 @@ class Command(object):
         # Don't want to load configuration to just print the version,
         # so we handle --version manually here.
         self.parser = self.create_parser(prog_name, command)
-        return self.parser.parse_args(arguments)
+        options = vars(self.parser.parse_args(arguments))
+        return options, options.pop(self.args_name, None) or []
 
     def create_parser(self, prog_name, command=None):
-        return self.prepare_parser(self.Parser(
+        # for compatibility with optparse usage.
+        usage = self.usage(command).replace('%prog', '%(prog)s')
+        parser = self.Parser(
             prog=prog_name,
-            usage=self.usage(command),
-            version=self.version,
-            epilog=self.epilog,
-            formatter=HelpFormatter(),
-            description=self.description,
-            option_list=(self.preload_options + self.get_options()),
-        ))
+            usage=usage,
+            epilog=self._format_epilog(self.epilog),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description=self._format_description(self.description),
+        )
+        self._add_version_argument(parser)
+        self.add_preload_arguments(parser)
+        self.add_arguments(parser)
+        self.add_compat_options(parser, self.get_options())
+        self.add_compat_options(parser, self.app.user_options['preload'])
+
+        if self.supports_args:
+            # for backward compatibility with optparse, we automatically
+            # add arbitrary positional args.
+            parser.add_argument(self.args_name, nargs='*')
+        return self.prepare_parser(parser)
+
+    def _format_epilog(self, epilog):
+        if epilog:
+            return '\n{0}\n\n'.format(epilog)
+        return ''
+
+    def _format_description(self, description):
+        width = argparse.HelpFormatter('prog')._width
+        return text.ensure_newlines(
+            text.fill_paragraphs(text.dedent(description), width))
+
+    def add_compat_options(self, parser, options):
+        _add_compat_options(parser, options)
 
     def prepare_parser(self, parser):
         docs = [self.parse_doc(doc) for doc in (self.doc, __doc__) if doc]
         for doc in docs:
             for long_opt, help in items(doc):
-                option = parser.get_option(long_opt)
+                option = parser._option_string_actions[long_opt]
                 if option is not None:
                     option.help = ' '.join(help).format(default=option.default)
         return parser
@@ -396,9 +467,11 @@ class Command(object):
         quiet = preload_options.get('quiet')
         if quiet is not None:
             self.quiet = quiet
-        self.colored.enabled = \
-            not preload_options.get('no_color', self.no_color)
-        workdir = preload_options.get('working_directory')
+        try:
+            self.no_color = preload_options['no_color']
+        except KeyError:
+            pass
+        workdir = preload_options.get('workdir')
         if workdir:
             os.chdir(workdir)
         app = (preload_options.get('app') or
@@ -414,42 +487,40 @@ class Command(object):
         broker = preload_options.get('broker', None)
         if broker:
             os.environ['CELERY_BROKER_URL'] = broker
+        result_backend = preload_options.get('result_backend', None)
+        if result_backend:
+            os.environ['CELERY_RESULT_BACKEND'] = result_backend
         config = preload_options.get('config')
         if config:
             os.environ['CELERY_CONFIG_MODULE'] = config
         if self.respects_app_option:
-            if app and self.respects_app_option:
+            if app:
                 self.app = self.find_app(app)
             elif self.app is None:
                 self.app = self.get_app(loader=loader)
             if self.enable_config_from_cmdline:
                 argv = self.process_cmdline_config(argv)
         else:
-            self.app = celery.Celery()
+            self.app = Celery(fixups=[])
+
+        self._handle_user_preload_options(argv)
+
         return argv
 
-    def find_app(self, app):
-        try:
-            sym = self.symbol_by_name(app)
-        except AttributeError:
-            # last part was not an attribute, but a module
-            sym = import_from_cwd(app)
-        if isinstance(sym, ModuleType):
-            try:
-                return sym.celery
-            except AttributeError:
-                if getattr(sym, '__path__', None):
-                    return self.find_app('{0}.celery:'.format(
-                                         app.replace(':', '')))
-                from celery.app.base import Celery
-                for suspect in values(vars(sym)):
-                    if isinstance(suspect, Celery):
-                        return suspect
-                raise
-        return sym
+    def _handle_user_preload_options(self, argv):
+        user_preload = tuple(self.app.user_options['preload'] or ())
+        if user_preload:
+            user_options = self._parse_preload_options(argv, user_preload)
+            signals.user_preload_options.send(
+                sender=self, app=self.app, options=user_options,
+            )
 
-    def symbol_by_name(self, name):
-        return symbol_by_name(name, imp=import_from_cwd)
+    def find_app(self, app):
+        from celery.app.utils import find_app
+        return find_app(app, symbol_by_name=self.symbol_by_name)
+
+    def symbol_by_name(self, name, imp=imports.import_from_cwd):
+        return imports.symbol_by_name(name, imp=imp)
     get_cls_by_name = symbol_by_name  # XXX compat
 
     def process_cmdline_config(self, argv):
@@ -462,27 +533,22 @@ class Command(object):
         return argv
 
     def parse_preload_options(self, args):
-        acc = {}
-        opts = {}
-        for opt in self.preload_options:
-            for t in (opt._long_opts, opt._short_opts):
-                opts.update(dict(zip(t, [opt.dest] * len(t))))
-        index = 0
-        length = len(args)
-        while index < length:
-            arg = args[index]
-            if arg.startswith('--') and '=' in arg:
-                key, value = arg.split('=', 1)
-                dest = opts.get(key)
-                if dest:
-                    acc[dest] = value
-            elif arg.startswith('-'):
-                dest = opts.get(arg)
-                if dest:
-                    acc[dest] = args[index + 1]
-                    index += 1
-            index += 1
-        return acc
+        return self._parse_preload_options(args, [self.add_preload_arguments])
+
+    def _parse_preload_options(self, args, options):
+        args = [arg for arg in args if arg not in ('-h', '--help')]
+        parser = self.Parser()
+        self.add_compat_options(parser, options)
+        namespace, _ = parser.parse_known_args(args)
+        return vars(namespace)
+
+    def add_append_opt(self, acc, opt, value):
+        default = opt.default or []
+
+        if opt.dest not in acc:
+            acc[opt.dest] = default
+
+        acc[opt.dest].append(value)
 
     def parse_doc(self, doc):
         options, in_option = defaultdict(list), None
@@ -493,26 +559,35 @@ class Command(object):
                     in_option = m.groups()[0].strip()
                 assert in_option, 'missing long opt'
             elif in_option and line.startswith(' ' * 4):
-                options[in_option].append(
-                    find_rst_ref.sub(r'\1', line.strip()).replace('`', ''))
+                if not find_rst_decl.match(line):
+                    options[in_option].append(
+                        find_rst_ref.sub(
+                            r'\1', line.strip()).replace('`', ''))
         return options
 
+    def _strip_restructeredtext(self, s):
+        return '\n'.join(
+            find_rst_ref.sub(r'\1', line.replace('`', ''))
+            for line in (s or '').splitlines()
+            if not find_rst_decl.match(line)
+        )
+
     def with_pool_option(self, argv):
-        """Returns tuple of ``(short_opts, long_opts)`` if the command
+        """Return tuple of ``(short_opts, long_opts)``.
+
+        Returns only if the command
         supports a pool argument, and used to monkey patch eventlet/gevent
         environments as early as possible.
 
-        E.g::
-              has_pool_option = (['-P'], ['--pool'])
+        Example:
+              >>> has_pool_option = (['-P'], ['--pool'])
         """
-        pass
 
-    def simple_format(self, s, match=find_sformat, expand=r'\1', **keys):
-        if s:
-            host = socket.gethostname()
-            name, _, domain = host.partition('.')
-            keys = dict({'%': '%', 'h': host, 'n': name, 'd': domain}, **keys)
-            return match.sub(lambda m: keys[m.expand(expand)], s)
+    def node_format(self, s, nodename, **extra):
+        return node_format(s, nodename, **extra)
+
+    def host_format(self, s, **extra):
+        return host_format(s, **extra)
 
     def _get_default_app(self, *args, **kwargs):
         from celery._state import get_current_app
@@ -551,6 +626,8 @@ class Command(object):
         if isinstance(n, dict):
             if 'ok' in n or 'error' in n:
                 return self.pretty_dict_ok_error(n)
+            else:
+                return OK, json.dumps(n, sort_keys=True, indent=4)
         if isinstance(n, string_t):
             return OK, string(n)
         return OK, pformat(n)
@@ -564,12 +641,34 @@ class Command(object):
         if body and self.show_body:
             self.out(body)
 
+    @property
+    def colored(self):
+        if self._colored is None:
+            self._colored = term.colored(
+                enabled=isatty(self.stdout) and not self.no_color)
+        return self._colored
 
-def daemon_options(default_pidfile=None, default_logfile=None):
-    return (
-        Option('-f', '--logfile', default=default_logfile),
-        Option('--pidfile', default=default_pidfile),
-        Option('--uid', default=None),
-        Option('--gid', default=None),
-        Option('--umask', default=0, type='int'),
-    )
+    @colored.setter
+    def colored(self, obj):
+        self._colored = obj
+
+    @property
+    def no_color(self):
+        return self._no_color
+
+    @no_color.setter
+    def no_color(self, value):
+        self._no_color = value
+        if self._colored is not None:
+            self._colored.enabled = not self._no_color
+
+
+def daemon_options(parser, default_pidfile=None, default_logfile=None):
+    """Add daemon options to argparse parser."""
+    group = parser.add_argument_group('Daemonization Options')
+    group.add_argument('-f', '--logfile', default=default_logfile),
+    group.add_argument('--pidfile', default=default_pidfile),
+    group.add_argument('--uid', default=None),
+    group.add_argument('--gid', default=None),
+    group.add_argument('--umask', default=None),
+    group.add_argument('--executable', default=None),

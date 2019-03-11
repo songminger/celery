@@ -1,3 +1,4 @@
-pytz
-billiard>=2.7.3.28
-kombu>=2.5.10
+pytz>dev
+billiard>=3.6.0,<4.0
+kombu>=4.4.0,<5.0
+vine>=1.2.0

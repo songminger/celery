@@ -1,6 +1,6 @@
 """myapp.py
 
-Usage:
+Usage::
 
    (window1)$ python myapp.py worker -l info
 
@@ -15,15 +15,28 @@ using the `-A` / `--app` option::
 
     $ celery -A myapp worker -l info
 
+With the `-A myproj` argument the program will search for an app
+instance in the module ``myproj``.  You can also specify an explicit
+name using the fully qualified form::
+
+    $ celery -A myapp:app worker -l info
+
 """
+from __future__ import absolute_import, unicode_literals
 from celery import Celery
 
-celery = Celery('myapp', broker='amqp://guest@localhost//')
+app = Celery(
+    'myapp',
+    broker='amqp://guest@localhost//',
+    # ## add result backend here if needed.
+    # backend='rpc'
+)
 
 
-@celery.task()
+@app.task
 def add(x, y):
     return x + y
 
+
 if __name__ == '__main__':
-    celery.start()
+    app.start()

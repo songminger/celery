@@ -1,33 +1,53 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.concurrency.base
-    ~~~~~~~~~~~~~~~~~~~~~~~
-
-    TaskPool interface.
-
-"""
-from __future__ import absolute_import
+"""Base Execution Pool."""
+from __future__ import absolute_import, unicode_literals
 
 import logging
 import os
-import time
+import sys
 
+from billiard.einfo import ExceptionInfo
+from billiard.exceptions import WorkerLostError
 from kombu.utils.encoding import safe_repr
 
+from celery.exceptions import WorkerShutdown, WorkerTerminate
+from celery.five import monotonic, reraise
 from celery.utils import timer2
 from celery.utils.log import get_logger
+from celery.utils.text import truncate
+
+__all__ = ('BasePool', 'apply_target')
 
 logger = get_logger('celery.pool')
 
 
 def apply_target(target, args=(), kwargs={}, callback=None,
-                 accept_callback=None, pid=None, **_):
+                 accept_callback=None, pid=None, getpid=os.getpid,
+                 propagate=(), monotonic=monotonic, **_):
+    """Apply function within pool context."""
     if accept_callback:
-        accept_callback(pid or os.getpid(), time.time())
-    callback(target(*args, **kwargs))
+        accept_callback(pid or getpid(), monotonic())
+    try:
+        ret = target(*args, **kwargs)
+    except propagate:
+        raise
+    except Exception:
+        raise
+    except (WorkerShutdown, WorkerTerminate):
+        raise
+    except BaseException as exc:
+        try:
+            reraise(WorkerLostError, WorkerLostError(repr(exc)),
+                    sys.exc_info()[2])
+        except WorkerLostError:
+            callback(ExceptionInfo())
+    else:
+        callback(ret)
 
 
 class BasePool(object):
+    """Task pool."""
+
     RUN = 0x1
     CLOSE = 0x2
     TERMINATE = 0x3
@@ -43,18 +63,22 @@ class BasePool(object):
 
     _state = None
     _pool = None
+    _does_debug = True
 
     #: only used by multiprocessing pool
     uses_semaphore = False
 
-    def __init__(self, limit=None, putlocks=True,
-                 forking_enable=True, callbacks_propagate=(), **options):
+    task_join_will_block = True
+    body_can_be_buffer = False
+
+    def __init__(self, limit=None, putlocks=True, forking_enable=True,
+                 callbacks_propagate=(), app=None, **options):
         self.limit = limit
         self.putlocks = putlocks
         self.options = options
         self.forking_enable = forking_enable
         self.callbacks_propagate = callbacks_propagate
-        self._does_debug = logger.isEnabledFor(logging.DEBUG)
+        self.app = app
 
     def on_start(self):
         pass
@@ -66,6 +90,9 @@ class BasePool(object):
         pass
 
     def on_stop(self):
+        pass
+
+    def register_with_event_loop(self, loop):
         pass
 
     def on_apply(self, *args, **kwargs):
@@ -80,13 +107,10 @@ class BasePool(object):
     def on_hard_timeout(self, job):
         pass
 
-    def maybe_handle_result(self, *args):
-        pass
-
     def maintain_pool(self, *args, **kwargs):
         pass
 
-    def terminate_job(self, pid):
+    def terminate_job(self, pid, signal=None):
         raise NotImplementedError(
             '{0} does not implement kill_job'.format(type(self)))
 
@@ -103,6 +127,7 @@ class BasePool(object):
         self.on_terminate()
 
     def start(self):
+        self._does_debug = logger.isEnabledFor(logging.DEBUG)
         self.on_start()
         self._state = self.RUN
 
@@ -113,19 +138,16 @@ class BasePool(object):
     def on_close(self):
         pass
 
-    def init_callbacks(self, **kwargs):
-        pass
-
     def apply_async(self, target, args=[], kwargs={}, **options):
         """Equivalent of the :func:`apply` built-in function.
 
         Callbacks should optimally return as soon as possible since
         otherwise the thread which handles the result will get blocked.
-
         """
         if self._does_debug:
             logger.debug('TaskPool: Apply %s (args:%s kwargs:%s)',
-                         target, safe_repr(args), safe_repr(kwargs))
+                         target, truncate(safe_repr(args), 1024),
+                         truncate(safe_repr(kwargs), 1024))
 
         return self.on_apply(target, args, kwargs,
                              waitforslot=self.putlocks,
@@ -133,7 +155,9 @@ class BasePool(object):
                              **options)
 
     def _get_info(self):
-        return {}
+        return {
+            'max-concurrency': self.limit,
+        }
 
     @property
     def info(self):
@@ -146,15 +170,3 @@ class BasePool(object):
     @property
     def num_processes(self):
         return self.limit
-
-    @property
-    def readers(self):
-        return {}
-
-    @property
-    def writers(self):
-        return {}
-
-    @property
-    def timers(self):
-        return {}

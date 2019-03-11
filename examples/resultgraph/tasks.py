@@ -13,15 +13,15 @@
 #
 # Joining the graph asynchronously with a callback
 # (Note: only two levels, the deps are considered final
-#        when the second task is ready.)
+#        when the second task is ready).
 #
 #    >>> unlock_graph.apply_async((A.apply_async(),
-#    ...                           A_callback.subtask()), countdown=1)
-
-
-from celery import chord, task, subtask
-from celery.result import AsyncResult, ResultSet
+#    ...                           A_callback.s()), countdown=1)
+from __future__ import absolute_import, print_function, unicode_literals
+from celery import chord, group, task, signature, uuid
+from celery.result import AsyncResult, ResultSet, allow_join_result
 from collections import deque
+
 
 @task()
 def add(x, y):
@@ -30,20 +30,22 @@ def add(x, y):
 
 @task()
 def make_request(id, url):
-    print('GET {0!r}'.format(url))
+    print('-get: {0!r}'.format(url))
     return url
 
 
 @task()
 def B_callback(urls, id):
-    print('batch {0} done'.format(id))
+    print('-batch {0} done'.format(id))
     return urls
 
 
 @task()
 def B(id):
-    return chord(make_request.s(id, '{0} {1!r}'.format(id, i))
-                    for i in range(10))(B_callback.s(id))
+    return chord(
+        make_request.s(id, '{0} {1!r}'.format(id, i))
+        for i in range(10)
+    )(B_callback.s(id))
 
 
 @task()
@@ -71,20 +73,21 @@ def joinall(R, timeout=None, propagate=True):
 
 
 @task()
-def unlock_graph(result, callback, interval=1, propagate=False,
-        max_retries=None):
+def unlock_graph(result, callback,
+                 interval=1, propagate=False, max_retries=None):
     if result.ready():
         second_level_res = result.get()
         if second_level_res.ready():
-            subtask(callback).delay(list(joinall(
-                second_level_res, propagate=propagate)))
+            with allow_join_result():
+                signature(callback).delay(list(joinall(
+                    second_level_res, propagate=propagate)))
     else:
         unlock_graph.retry(countdown=interval, max_retries=max_retries)
 
 
 @task()
 def A_callback(res):
-    print('Everything is done: {0!r}'.format(res))
+    print('-everything done: {0!r}'.format(res))
     return res
 
 

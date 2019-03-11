@@ -5,7 +5,7 @@ For asynchronous DNS lookups install the `dnspython` package:
     $ pip install dnspython
 
 Requires the `pybloom` module for the bloom filter which is used
-to ensure a lower chance of recrawling an URL previously seen.
+to ensure a lower chance of recrawling a URL previously seen.
 
 Since the bloom filter is not shared, but only passed as an argument
 to each subtask, it would be much better to have this as a centralized
@@ -18,19 +18,17 @@ up 2.9kB(!).
 We don't have to do compression manually, just set the tasks compression
 to "zlib", and the serializer to "pickle".
 
-
 """
-
-
+from __future__ import absolute_import, print_function, unicode_literals
 import re
-import time
-import urlparse
-
+import requests
 from celery import task, group
 from eventlet import Timeout
-from eventlet.green import urllib2
-
 from pybloom import BloomFilter
+try:
+    from urllib.parse import urlsplit
+except ImportError:
+    from urlparse import urlsplit  # noqa
 
 # http://daringfireball.net/2009/11/liberal_regex_for_matching_urls
 url_regex = re.compile(
@@ -38,8 +36,8 @@ url_regex = re.compile(
 
 
 def domain(url):
-    """Returns the domain part of an URL."""
-    return urlparse.urlsplit(url)[1].split(':')[0]
+    """Return the domain part of a URL."""
+    return urlsplit(url)[1].split(':')[0]
 
 
 @task(ignore_result=True, serializer='pickle', compression='zlib')
@@ -50,13 +48,13 @@ def crawl(url, seen=None):
 
     with Timeout(5, False):
         try:
-            data = urllib2.urlopen(url).read()
-        except (urllib2.HTTPError, IOError):
+            response = requests.get(url)
+        except requests.exception.RequestError:
             return
 
     location = domain(url)
     wanted_urls = []
-    for url_match in url_regex.finditer(data):
+    for url_match in url_regex.finditer(response.text):
         url = url_match.group(0)
         # To not destroy the internet, we only fetch URLs on the same domain.
         if url not in seen and location in domain(url):
@@ -64,4 +62,4 @@ def crawl(url, seen=None):
             seen.add(url)
 
     subtasks = group(crawl.s(url, seen) for url in wanted_urls)
-    subtasks.apply_async()
+    subtasks.delay()

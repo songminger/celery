@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-"""
-    celery.concurrency.eventlet
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""Eventlet execution pool."""
+from __future__ import absolute_import, unicode_literals
 
-    Eventlet pool implementation.
-
-"""
-from __future__ import absolute_import
-
-import os
 import sys
 
-EVENTLET_NOPATCH = os.environ.get('EVENTLET_NOPATCH', False)
-EVENTLET_DBLOCK = int(os.environ.get('EVENTLET_NOBLOCK', 0))
+from kombu.asynchronous import timer as _timer  # noqa
+from kombu.five import monotonic
+
+from celery import signals  # noqa
+
+from . import base  # noqa
+
+__all__ = ('TaskPool',)
+
 W_RACE = """\
 Celery module with %s imported before eventlet patched\
 """
@@ -22,26 +22,10 @@ RACE_MODS = ('billiard.', 'celery.', 'kombu.')
 #: Warn if we couldn't patch early enough,
 #: and thread/socket depending celery modules have already been loaded.
 for mod in (mod for mod in sys.modules if mod.startswith(RACE_MODS)):
-    for side in ('thread', 'threading', 'socket'):
+    for side in ('thread', 'threading', 'socket'):  # pragma: no cover
         if getattr(mod, side, None):
             import warnings
             warnings.warn(RuntimeWarning(W_RACE % side))
-
-
-PATCHED = [0]
-if not EVENTLET_NOPATCH and not PATCHED[0]:
-    PATCHED[0] += 1
-    import eventlet
-    import eventlet.debug
-    eventlet.monkey_patch()
-    eventlet.debug.hub_blocking_detection(EVENTLET_DBLOCK)
-
-from time import time
-
-from celery import signals
-from celery.utils import timer2
-
-from . import base
 
 
 def apply_target(target, args=(), kwargs={}, callback=None,
@@ -50,26 +34,27 @@ def apply_target(target, args=(), kwargs={}, callback=None,
                              pid=getpid())
 
 
-class Schedule(timer2.Schedule):
+class Timer(_timer.Timer):
+    """Eventlet Timer."""
 
     def __init__(self, *args, **kwargs):
         from eventlet.greenthread import spawn_after
         from greenlet import GreenletExit
-        super(Schedule, self).__init__(*args, **kwargs)
+        super(Timer, self).__init__(*args, **kwargs)
 
         self.GreenletExit = GreenletExit
         self._spawn_after = spawn_after
         self._queue = set()
 
-    def _enter(self, eta, priority, entry):
-        secs = max(eta - time(), 0)
+    def _enter(self, eta, priority, entry, **kwargs):
+        secs = max(eta - monotonic(), 0)
         g = self._spawn_after(secs, entry)
         self._queue.add(g)
         g.link(self._entry_exit, entry)
         g.entry = entry
         g.eta = eta
         g.priority = priority
-        g.cancelled = False
+        g.canceled = False
         return g
 
     def _entry_exit(self, g, entry):
@@ -78,7 +63,7 @@ class Schedule(timer2.Schedule):
                 g.wait()
             except self.GreenletExit:
                 entry.cancel()
-                g.cancelled = True
+                g.canceled = True
         finally:
             self._queue.discard(g)
 
@@ -90,35 +75,27 @@ class Schedule(timer2.Schedule):
             except (KeyError, self.GreenletExit):
                 pass
 
-    @property
-    def queue(self):
-        return [(g.eta, g.priority, g.entry) for g in self._queue]
-
-
-class Timer(timer2.Timer):
-    Schedule = Schedule
-
-    def ensure_started(self):
-        pass
-
-    def stop(self):
-        self.schedule.clear()
-
     def cancel(self, tref):
         try:
             tref.cancel()
-        except self.schedule.GreenletExit:
+        except self.GreenletExit:
             pass
 
-    def start(self):
-        pass
+    @property
+    def queue(self):
+        return self._queue
 
 
 class TaskPool(base.BasePool):
+    """Eventlet Task Pool."""
+
     Timer = Timer
 
     signal_safe = False
     is_green = True
+    task_join_will_block = False
+    _pool = None
+    _quick_put = None
 
     def __init__(self, *args, **kwargs):
         from eventlet import greenthread
@@ -150,3 +127,22 @@ class TaskPool(base.BasePool):
         self._quick_put(apply_target, target, args, kwargs,
                         callback, accept_callback,
                         self.getpid)
+
+    def grow(self, n=1):
+        limit = self.limit + n
+        self._pool.resize(limit)
+        self.limit = limit
+
+    def shrink(self, n=1):
+        limit = self.limit - n
+        self._pool.resize(limit)
+        self.limit = limit
+
+    def _get_info(self):
+        info = super(TaskPool, self)._get_info()
+        info.update({
+            'max-concurrency': self.limit,
+            'free-threads': self._pool.free(),
+            'running-threads': self._pool.running(),
+        })
+        return info

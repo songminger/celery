@@ -1,456 +1,155 @@
-========
- celery
-========
+===========================================
+ :mod:`celery` --- Distributed processing
+===========================================
 
 .. currentmodule:: celery
-
 .. module:: celery
+    :synopsis: Distributed processing
+.. moduleauthor:: Ask Solem <ask@celeryproject.org>
+.. sectionauthor:: Ask Solem <ask@celeryproject.org>
 
-
-.. contents::
-    :local:
-
-Application
------------
-
-.. class:: Celery(main='__main__', broker='amqp://localhost//', ...)
-
-    :param main: Name of the main module if running as `__main__`.
-    :keyword broker: URL of the default broker used.
-    :keyword loader: The loader class, or the name of the loader class to use.
-                     Default is :class:`celery.loaders.app.AppLoader`.
-    :keyword backend: The result store backend class, or the name of the
-                      backend class to use. Default is the value of the
-                      :setting:`CELERY_RESULT_BACKEND` setting.
-    :keyword amqp: AMQP object or class name.
-    :keyword events: Events object or class name.
-    :keyword log: Log object or class name.
-    :keyword control: Control object or class name.
-    :keyword set_as_current:  Make this the global current app.
-    :keyword tasks: A task registry or the name of a registry class.
-
-    .. attribute:: Celery.main
-
-        Name of the `__main__` module.  Required for standalone scripts.
-
-        If set this will be used instead of `__main__` when automatically
-        generating task names.
-
-    .. attribute:: Celery.conf
-
-        Current configuration.
-
-    .. attribute:: user_options
-
-        Custom options for command-line programs.
-        See :ref:`extending-commandoptions`
-
-    .. attribute:: steps
-
-        Custom bootsteps to extend and modify the worker.
-        See :ref:`extending-bootsteps`.
-
-    .. attribute:: Celery.current_task
-
-        The instance of the task that is being executed, or :const:`None`.
-
-    .. attribute:: Celery.amqp
-
-        AMQP related functionality: :class:`~@amqp`.
-
-    .. attribute:: Celery.backend
-
-        Current backend instance.
-
-    .. attribute:: Celery.loader
-
-        Current loader instance.
-
-    .. attribute:: Celery.control
-
-        Remote control: :class:`~@control`.
-
-    .. attribute:: Celery.events
-
-        Consuming and sending events: :class:`~@events`.
-
-    .. attribute:: Celery.log
-
-        Logging: :class:`~@log`.
-
-    .. attribute:: Celery.tasks
-
-        Task registry.
-
-        Accessing this attribute will also finalize the app.
-
-    .. attribute:: Celery.pool
-
-        Broker connection pool: :class:`~@pool`.
-        This attribute is not related to the workers concurrency pool.
-
-    .. attribute:: Celery.Task
-
-        Base task class for this app.
-
-    .. method:: Celery.close
-
-        Cleans-up after application, like closing any pool connections.
-        Only necessary for dynamically created apps for which you can
-        use the with statement::
-
-            with Celery(set_as_current=False) as app:
-                with app.connection() as conn:
-                    pass
-
-    .. method:: Celery.bugreport
-
-        Returns a string with information useful for the Celery core
-        developers when reporting a bug.
-
-    .. method:: Celery.config_from_object(obj, silent=False)
-
-        Reads configuration from object, where object is either
-        an object or the name of a module to import.
-
-        :keyword silent: If true then import errors will be ignored.
-
-        .. code-block:: python
-
-            >>> celery.config_from_object("myapp.celeryconfig")
-
-            >>> from myapp import celeryconfig
-            >>> celery.config_from_object(celeryconfig)
-
-    .. method:: Celery.config_from_envvar(variable_name, silent=False)
-
-        Read configuration from environment variable.
-
-        The value of the environment variable must be the name
-        of a module to import.
-
-        .. code-block:: python
-
-            >>> os.environ["CELERY_CONFIG_MODULE"] = "myapp.celeryconfig"
-            >>> celery.config_from_envvar("CELERY_CONFIG_MODULE")
-
-    .. method:: Celery.autodiscover_tasks(packages, related_name="tasks")
-
-        With a list of packages, try to import modules of a specific name (by
-        default 'tasks').
-
-        For example if you have an (imagined) directory tree like this::
-
-            foo/__init__.py
-               tasks.py
-               models.py
-
-            bar/__init__.py
-                tasks.py
-                models.py
-
-            baz/__init__.py
-                models.py
-
-        Then calling ``app.autodiscover_tasks(['foo', bar', 'baz'])`` will
-        result in the modules ``foo.tasks`` and ``bar.tasks`` being imported.
-
-    .. method:: Celery.add_defaults(d)
-
-        Add default configuration from dict ``d``.
-
-        If the argument is a callable function then it will be regarded
-        as a promise, and it won't be loaded until the configuration is
-        actually needed.
-
-        This method can be compared to::
-
-            >>> celery.conf.update(d)
-
-        with a difference that 1) no copy will be made and 2) the dict will
-        not be transferred when the worker spawns child processes, so
-        it's important that the same configuration happens at import time
-        when pickle restores the object on the other side.
-
-    .. method:: Celery.start(argv=None)
-
-        Run :program:`celery` using `argv`.
-
-        Uses :data:`sys.argv` if `argv` is not specified.
-
-    .. method:: Celery.task(fun, ...)
-
-        Decorator to create a task class out of any callable.
-
-        Examples:
-
-        .. code-block:: python
-
-            @celery.task
-            def refresh_feed(url):
-                return ...
-
-        with setting extra options:
-
-        .. code-block:: python
-
-            @celery.task(exchange="feeds")
-            def refresh_feed(url):
-                return ...
-
-        .. admonition:: App Binding
-
-            For custom apps the task decorator returns proxy
-            objects, so that the act of creating the task is not performed
-            until the task is used or the task registry is accessed.
-
-            If you are depending on binding to be deferred, then you must
-            not access any attributes on the returned object until the
-            application is fully set up (finalized).
-
-
-    .. method:: Celery.send_task(name[, args[, kwargs[, ...]]])
-
-        Send task by name.
-
-        :param name: Name of task to call (e.g. `"tasks.add"`).
-        :keyword result_cls: Specify custom result class. Default is
-            using :meth:`AsyncResult`.
-
-        Otherwise supports the same arguments as :meth:`@-Task.apply_async`.
-
-    .. attribute:: Celery.AsyncResult
-
-        Create new result instance. See :class:`~celery.result.AsyncResult`.
-
-    .. attribute:: Celery.GroupResult
-
-        Create new taskset result instance.
-        See :class:`~celery.result.GroupResult`.
-
-    .. method:: Celery.worker_main(argv=None)
-
-        Run :program:`celery worker` using `argv`.
-
-        Uses :data:`sys.argv` if `argv` is not specified."""
-
-    .. attribute:: Celery.Worker
-
-        Worker application. See :class:`~@Worker`.
-
-    .. attribute:: Celery.WorkController
-
-        Embeddable worker. See :class:`~@WorkController`.
-
-    .. attribute:: Celery.Beat
-
-        Celerybeat scheduler application.
-        See :class:`~@Beat`.
-
-    .. method:: Celery.connection(url=default, [ssl, [transport_options={}]])
-
-        Establish a connection to the message broker.
-
-        :param url: Either the URL or the hostname of the broker to use.
-
-        :keyword hostname: URL, Hostname/IP-address of the broker.
-            If an URL is used, then the other argument below will
-            be taken from the URL instead.
-        :keyword userid: Username to authenticate as.
-        :keyword password: Password to authenticate with
-        :keyword virtual_host: Virtual host to use (domain).
-        :keyword port: Port to connect to.
-        :keyword ssl: Defaults to the :setting:`BROKER_USE_SSL` setting.
-        :keyword transport: defaults to the :setting:`BROKER_TRANSPORT`
-                 setting.
-
-        :returns :class:`kombu.Connection`:
-
-    .. method:: Celery.connection_or_acquire(connection=None)
-
-        For use within a with-statement to get a connection from the pool
-        if one is not already provided.
-
-        :keyword connection: If not provided, then a connection will be
-                             acquired from the connection pool.
-
-    .. method:: Celery.producer_or_acquire(producer=None)
-
-        For use within a with-statement to get a producer from the pool
-        if one is not already provided
-
-        :keyword producer: If not provided, then a producer will be
-                           acquired from the producer pool.
-
-    .. method:: Celery.mail_admins(subject, body, fail_silently=False)
-
-        Sends an email to the admins in the :setting:`ADMINS` setting.
-
-    .. method:: Celery.select_queues(queues=[])
-
-        Select a subset of queues, where queues must be a list of queue
-        names to keep.
-
-    .. method:: Celery.now()
-
-        Returns the current time and date as a :class:`~datetime.datetime`
-        object.
-
-    .. method:: Celery.set_current()
-
-        Makes this the current app for this thread.
-
-    .. method:: Celery.finalize()
-
-        Finalizes the app by loading built-in tasks,
-        and evaluating pending task decorators
-
-    .. attribute:: Celery.Pickler
-
-        Helper class used to pickle this application.
-
-Grouping Tasks
 --------------
 
-.. class:: group(task1[, task2[, task3[,... taskN]]])
+This module is the main entry-point for the Celery API.
+It includes commonly needed things for calling tasks,
+and creating Celery applications.
 
-    Creates a group of tasks to be executed in parallel.
+===================== ===================================================
+:class:`Celery`       Celery application instance
+:class:`group`        group tasks together
+:class:`chain`        chain tasks together
+:class:`chord`        chords enable callbacks for groups
+:func:`signature`     create a new task signature
+:class:`Signature`    object describing a task invocation
+:data:`current_app`   proxy to the current application instance
+:data:`current_task`  proxy to the currently executing task
+===================== ===================================================
 
-    Example::
+:class:`Celery` application objects
+-----------------------------------
 
-        >>> res = group([add.s(2, 2), add.s(4, 4)]).apply_async()
-        >>> res.get()
-        [4, 8]
+.. versionadded:: 2.5
 
-    The ``apply_async`` method returns :class:`~@GroupResult`.
+.. autoclass:: Celery
 
-.. class:: chain(task1[, task2[, task3[,... taskN]]])
 
-    Chains tasks together, so that each tasks follows each other
-    by being applied as a callback of the previous task.
+    .. autoattribute:: user_options
 
-    If called with only one argument, then that argument must
-    be an iterable of tasks to chain.
+    .. autoattribute:: steps
 
-    Example::
+    .. autoattribute:: current_task
 
-        >>> res = chain(add.s(2, 2), add.s(4)).apply_async()
+    .. autoattribute:: current_worker_task
 
-    is effectively :math:`(2 + 2) + 4)`::
+    .. autoattribute:: amqp
 
-        >>> res.get()
-        8
+    .. autoattribute:: backend
 
-    Calling a chain will return the result of the last task in the chain.
-    You can get to the other tasks by following the ``result.parent``'s::
+    .. autoattribute:: loader
 
-        >>> res.parent.get()
-        4
+    .. autoattribute:: control
+    .. autoattribute:: events
+    .. autoattribute:: log
+    .. autoattribute:: tasks
+    .. autoattribute:: pool
+    .. autoattribute:: producer_pool
+    .. autoattribute:: Task
+    .. autoattribute:: timezone
+    .. autoattribute:: builtin_fixups
+    .. autoattribute:: oid
 
-.. class:: chord(header[, body])
+    .. automethod:: close
 
-    A chord consists of a header and a body.
-    The header is a group of tasks that must complete before the callback is
-    called.  A chord is essentially a callback for a group of tasks.
+    .. automethod:: signature
 
-    Example::
+    .. automethod:: bugreport
 
-        >>> res = chord([add.s(2, 2), add.s(4, 4)])(sum_task.s())
+    .. automethod:: config_from_object
 
-    is effectively :math:`\Sigma ((2 + 2) + (4 + 4))`::
+    .. automethod:: config_from_envvar
 
-        >>> res.get()
-        12
+    .. automethod:: autodiscover_tasks
 
-    The body is applied with the return values of all the header
-    tasks as a list.
+    .. automethod:: add_defaults
 
-.. class:: subtask(task=None, args=(), kwargs={}, options={})
+    .. automethod:: add_periodic_task
 
-    Describes the arguments and execution options for a single task invocation.
+    .. automethod:: setup_security
 
-    Used as the parts in a :class:`group` or to safely pass
-    tasks around as callbacks.
+    .. automethod:: start
 
-    Subtasks can also be created from tasks::
+    .. automethod:: task
 
-        >>> add.subtask(args=(), kwargs={}, options={})
+    .. automethod:: send_task
 
-    or the ``.s()`` shortcut::
+    .. automethod:: gen_task_name
 
-        >>> add.s(*args, **kwargs)
+    .. autoattribute:: AsyncResult
 
-    :param task: Either a task class/instance, or the name of a task.
-    :keyword args: Positional arguments to apply.
-    :keyword kwargs: Keyword arguments to apply.
-    :keyword options: Additional options to :meth:`Task.apply_async`.
+    .. autoattribute:: GroupResult
 
-    Note that if the first argument is a :class:`dict`, the other
-    arguments will be ignored and the values in the dict will be used
-    instead.
+    .. automethod:: worker_main
 
-        >>> s = subtask("tasks.add", args=(2, 2))
-        >>> subtask(s)
-        {"task": "tasks.add", args=(2, 2), kwargs={}, options={}}
+    .. autoattribute:: Worker
 
-    .. method:: subtask.delay(*args, \*\*kwargs)
+    .. autoattribute:: WorkController
 
-        Shortcut to :meth:`apply_async`.
+    .. autoattribute:: Beat
 
-    .. method:: subtask.apply_async(args=(), kwargs={}, ...)
+    .. automethod:: connection_for_read
 
-        Apply this task asynchronously.
+    .. automethod:: connection_for_write
 
-        :keyword args: Partial args to be prepended to the existing args.
-        :keyword kwargs: Partial kwargs to be merged with the existing kwargs.
-        :keyword options: Partial options to be merged with the existing
-                          options.
+    .. automethod:: connection
 
-        See :meth:`~@Task.apply_async`.
+    .. automethod:: connection_or_acquire
 
-    .. method:: subtask.apply(args=(), kwargs={}, ...)
+    .. automethod:: producer_or_acquire
 
-        Same as :meth:`apply_async` but executed the task inline instead
-        of sending a task message.
+    .. automethod:: select_queues
 
-    .. method:: subtask.clone(args=(), kwargs={}, ...)
+    .. automethod:: now
 
-        Returns a copy of this subtask.
+    .. automethod:: set_current
 
-        :keyword args: Partial args to be prepended to the existing args.
-        :keyword kwargs: Partial kwargs to be merged with the existing kwargs.
-        :keyword options: Partial options to be merged with the existing
-                          options.
+    .. automethod:: set_default
 
-    .. method:: subtask.replace(args=None, kwargs=None, options=None)
+    .. automethod:: finalize
 
-        Replace the args, kwargs or options set for this subtask.
-        These are only replaced if the selected is not :const:`None`.
+    .. automethod:: on_init
 
-    .. method:: subtask.link(other_subtask)
+    .. automethod:: prepare_config
 
-        Add a callback task to be applied if this task
-        executes successfully.
+    .. data:: on_configure
 
-        :returns: ``other_subtask`` (to work with :func:`~functools.reduce`).
+        Signal sent when app is loading configuration.
 
-    .. method:: subtask.link_error(other_subtask)
+    .. data:: on_after_configure
 
-        Add a callback task to be applied if an error occurs
-        while executing this task.
+        Signal sent after app has prepared the configuration.
 
-        :returns: ``other_subtask`` (to work with :func:`~functools.reduce`)
+    .. data:: on_after_finalize
 
-    .. method:: subtask.set(...)
+        Signal sent after app has been finalized.
 
-        Set arbitrary options (same as ``.options.update(...)``).
+    .. data:: on_after_fork
 
-        This is a chaining method call (i.e. it returns itself).
+        Signal sent in child process after fork.
 
-    .. method:: subtask.flatten_links()
+Canvas primitives
+-----------------
 
-        Gives a recursive list of dependencies (unchain if you will,
-        but with links intact).
+See :ref:`guide-canvas` for more about creating task work-flows.
+
+.. autoclass:: group
+
+.. autoclass:: chain
+
+.. autoclass:: chord
+
+.. autofunction:: signature
+
+.. autoclass:: Signature
 
 Proxies
 -------

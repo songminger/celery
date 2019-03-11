@@ -1,4 +1,5 @@
-from __future__ import absolute_import
+"""Worker Pidbox (remote control)."""
+from __future__ import absolute_import, unicode_literals
 
 import socket
 import threading
@@ -6,16 +7,21 @@ import threading
 from kombu.common import ignore_errors
 from kombu.utils.encoding import safe_str
 
-from celery.datastructures import AttributeDict
+from celery.utils.collections import AttributeDict
+from celery.utils.functional import pass1
 from celery.utils.log import get_logger
 
 from . import control
+
+__all__ = ('Pidbox', 'gPidbox')
 
 logger = get_logger(__name__)
 debug, error, info = logger.debug, logger.error, logger.info
 
 
 class Pidbox(object):
+    """Worker mailbox."""
+
     consumer = None
 
     def __init__(self, c):
@@ -24,10 +30,18 @@ class Pidbox(object):
         self.node = c.app.control.mailbox.Node(
             safe_str(c.hostname),
             handlers=control.Panel.data,
-            state=AttributeDict(app=c.app, hostname=c.hostname, consumer=c),
+            state=AttributeDict(
+                app=c.app,
+                hostname=c.hostname,
+                consumer=c,
+                tset=pass1 if c.controller.use_eventloop else set),
         )
+        self._forward_clock = self.c.app.clock.forward
 
     def on_message(self, body, message):
+        # just increase clock as clients usually don't
+        # have a valid clock to adjust with.
+        self._forward_clock()
         try:
             self.node.handle_message(body, message)
         except KeyError as exc:
@@ -39,12 +53,16 @@ class Pidbox(object):
     def start(self, c):
         self.node.channel = c.connection.channel()
         self.consumer = self.node.listen(callback=self.on_message)
+        self.consumer.on_decode_error = c.on_decode_error
+
+    def on_stop(self):
+        pass
 
     def stop(self, c):
+        self.on_stop()
         self.consumer = self._close_channel(c)
 
     def reset(self):
-        """Sets up the process mailbox."""
         self.stop(self.c)
         self.start(self.c)
 
@@ -53,13 +71,16 @@ class Pidbox(object):
             ignore_errors(c, self.node.channel.close)
 
     def shutdown(self, c):
+        self.on_stop()
         if self.consumer:
-            debug('Cancelling broadcast consumer...')
+            debug('Canceling broadcast consumer...')
             ignore_errors(c, self.consumer.cancel)
         self.stop(self.c)
 
 
 class gPidbox(Pidbox):
+    """Worker pidbox (greenlet)."""
+
     _node_shutdown = None
     _node_stopped = None
     _resets = 0
@@ -67,13 +88,12 @@ class gPidbox(Pidbox):
     def start(self, c):
         c.pool.spawn_n(self.loop, c)
 
-    def stop(self, c):
+    def on_stop(self):
         if self._node_stopped:
             self._node_shutdown.set()
             debug('Waiting for broadcast thread to shutdown...')
             self._node_stopped.wait()
             self._node_stopped = self._node_shutdown = None
-        super(gPidbox, self).stop(c)
 
     def reset(self):
         self._resets += 1
@@ -89,8 +109,7 @@ class gPidbox(Pidbox):
         shutdown = self._node_shutdown = threading.Event()
         stopped = self._node_stopped = threading.Event()
         try:
-            with c.connect() as connection:
-
+            with c.connection_for_read() as connection:
                 info('pidbox: Connected to %s.', connection.as_uri())
                 self._do_reset(c, connection)
                 while not shutdown.is_set() and c.connection:

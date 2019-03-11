@@ -12,6 +12,7 @@ module (when this is installed all name lookups will be asynchronous)::
 
     $ pip install eventlet
     $ pip install dnspython
+    $ pip install requests
 
 Before you run any of the example tasks you need to start
 the worker::
@@ -33,7 +34,7 @@ of the response body::
     $ cd examples/eventlet
     $ python
     >>> from tasks import urlopen
-    >>> urlopen.delay("http://www.google.com/").get()
+    >>> urlopen.delay('http://www.google.com/').get()
     9980
 
 To open several URLs at once you can do::
@@ -45,7 +46,7 @@ To open several URLs at once you can do::
     >>> result = group(urlopen.s(url)
     ...                     for url in LIST_OF_URLS).apply_async()
     >>> for incoming_result in result.iter_native():
-    ...     print(incoming_result, )
+    ...     print(incoming_result)
 
 * `webcrawler.crawl`
 

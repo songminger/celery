@@ -1,165 +1,104 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import, unicode_literals
 
-import sys
-import os
+from sphinx_celery import conf
 
-# eventlet/gevent should not monkey patch anything.
-os.environ["GEVENT_NOPATCH"] = "yes"
-os.environ["EVENTLET_NOPATCH"] = "yes"
-os.environ["CELERY_LOADER"] = "default"
+globals().update(conf.build_config(
+    'celery', __file__,
+    project='Celery',
+    version_dev='5.0',
+    version_stable='4.0',
+    canonical_url='http://docs.celeryproject.org',
+    webdomain='celeryproject.org',
+    github_project='celery/celery',
+    author='Ask Solem & contributors',
+    author_name='Ask Solem',
+    copyright='2009-2018',
+    publisher='Celery Project',
+    html_logo='images/celery_512.png',
+    html_favicon='images/favicon.ico',
+    html_prepend_sidebars=['sidebardonations.html'],
+    extra_extensions=[
+        'sphinx.ext.napoleon',
+        'celery.contrib.sphinx',
+        'celerydocs',
+    ],
+    extra_intersphinx_mapping={
+        'cyanide': ('https://cyanide.readthedocs.io/en/latest', None),
+    },
+    apicheck_ignore_modules=[
+        'celery.five',
+        'celery.__main__',
+        'celery.task',
+        'celery.contrib.testing',
+        'celery.contrib.testing.tasks',
+        'celery.task.base',
+        'celery.bin',
+        'celery.bin.celeryd_detach',
+        'celery.contrib',
+        r'celery.fixups.*',
+        'celery.local',
+        'celery.app.base',
+        'celery.apps',
+        'celery.canvas',
+        'celery.concurrency.asynpool',
+        'celery.utils.encoding',
+        r'celery.utils.static.*',
+    ],
+    linkcheck_ignore=[
+        r'^http://localhost'
+    ]
+))
 
-this = os.path.dirname(os.path.abspath(__file__))
+settings = {}
+ignored_settings = {
+    # Deprecated broker settings (replaced by broker_url)
+    'broker_host',
+    'broker_user',
+    'broker_password',
+    'broker_vhost',
+    'broker_port',
+    'broker_transport',
 
-# If your extensions are in another directory, add it here. If the directory
-# is relative to the documentation root, use os.path.abspath to make it
-# absolute, like shown here.
-sys.path.append(os.path.join(os.pardir, "tests"))
-sys.path.append(os.path.join(this, "_ext"))
-import celery
+    # deprecated task settings.
+    'chord_propagates',
 
+    # MongoDB settings replaced by URL config.,
+    'mongodb_backend_settings',
 
-# use app loader
-from celery import Celery
-app = Celery(set_as_current=True)
-app.conf.update(BROKER_URL="memory://",
-                CELERY_RESULT_BACKEND="cache",
-                CELERY_CACHE_BACKEND="memory",
-                CELERYD_HIJACK_ROOT_LOGGER=False,
-                CELERYD_LOG_COLOR=False)
+    # Database URL replaced by URL config (result_backend = db+...).
+    'database_url',
 
-# General configuration
-# ---------------------
+    # Redis settings replaced by URL config.
+    'redis_host',
+    'redis_port',
+    'redis_db',
+    'redis_password',
 
-extensions = ['sphinx.ext.autodoc',
-              'sphinx.ext.coverage',
-              'sphinx.ext.pngmath',
-              'sphinx.ext.viewcode',
-              'sphinx.ext.coverage',
-              'sphinx.ext.intersphinx',
-              'sphinxcontrib.issuetracker',
-              'celerydocs']
+    # Old deprecated AMQP result backend.
+    'result_exchange',
+    'result_exchange_type',
 
+    # Experimental
+    'worker_agent',
 
-LINKCODE_URL = 'http://github.com/{proj}/tree/{branch}/{filename}.py'
-GITHUB_PROJECT = 'celery/celery'
-GITHUB_BRANCH = 'master'
-
-def linkcode_resolve(domain, info):
-    if domain != 'py' or not info['module']:
-        return
-    filename = info['module'].replace('.', '/')
-    return LINKCODE_URL.format(
-        proj=GITHUB_PROJECT,
-        branch=GITHUB_BRANCH,
-        filename=FILENAME,
-    )
-
-html_show_sphinx = False
-
-# Add any paths that contain templates here, relative to this directory.
-templates_path = ['.templates']
-
-# The suffix of source filenames.
-source_suffix = '.rst'
-
-# The master toctree document.
-master_doc = 'index'
-
-# General information about the project.
-project = u'Celery'
-copyright = u'2009-2012, Ask Solem & Contributors'
-
-# The version info for the project you're documenting, acts as replacement for
-# |version| and |release|, also used in various other places throughout the
-# built documents.
-#
-# The short X.Y version.
-version = '.'.join(map(str, celery.VERSION[0:2]))
-# The full version, including alpha/beta/rc tags.
-release = celery.__version__
-
-exclude_trees = ['.build']
-
-# If true, '()' will be appended to :func: etc. cross-reference text.
-add_function_parentheses = True
-
-intersphinx_mapping = {
-    'python': ('http://docs.python.org/dev', None),
-    'kombu': ('http://kombu.readthedocs.org/en/latest/', None),
-    'djcelery': ('http://django-celery.readthedocs.org/en/latest', None),
-    'cyme': ('http://cyme.readthedocs.org/en/latest', None),
-    'amqp': ('http://amqp.readthedocs.org/en/latest', None),
+    # Deprecated worker settings.
+    'worker_pool_putlocks',
 }
 
-# The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'colorful'
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory. They are copied after the builtin static files,
-# so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['.static']
-
-html_use_smartypants = True
-
-# If false, no module index is generated.
-html_use_modindex = True
-
-# If false, no index is generated.
-html_use_index = True
-
-latex_documents = [
-  ('index', 'Celery.tex', ur'Celery Documentation',
-   ur'Ask Solem & Contributors', 'manual'),
-]
-
-html_theme = "celery"
-html_theme_path = ["_theme"]
-html_sidebars = {
-    'index': ['sidebarintro.html', 'sourcelink.html', 'searchbox.html'],
-    '**': ['sidebarlogo.html', 'relations.html',
-           'sourcelink.html', 'searchbox.html'],
-}
-
-### Issuetracker
-
-if False:
-    issuetracker = "github"
-    issuetracker_project = "celery/celery"
-    issuetracker_issue_pattern = r'[Ii]ssue #(\d+)'
-
-# -- Options for Epub output ---------------------------------------------------
-
-# Bibliographic Dublin Core info.
-epub_title = 'Celery Manual, Version {0}'.format(version)
-epub_author = 'Ask Solem'
-epub_publisher = 'Celery Project'
-epub_copyright = '2009-2012'
-
-# The language of the text. It defaults to the language option
-# or en if the language is not set.
-epub_language = 'en'
-
-# The scheme of the identifier. Typical schemes are ISBN or URL.
-epub_scheme = 'ISBN'
-
-# The unique identifier of the text. This can be a ISBN number
-# or the project homepage.
-epub_identifier = 'celeryproject.org'
-
-# A unique identification for the text.
-epub_uid = 'Celery Manual, Version {0}'.format(version)
-
-# HTML files that should be inserted before the pages created by sphinx.
-# The format is a list of tuples containing the path and title.
-#epub_pre_files = []
-
-# HTML files shat should be inserted after the pages created by sphinx.
-# The format is a list of tuples containing the path and title.
-#epub_post_files = []
-
-# A list of files that should not be packed into the epub file.
-epub_exclude_files = ['search.html']
+def configcheck_project_settings():
+    from celery.app.defaults import NAMESPACES, flatten
+    settings.update(dict(flatten(NAMESPACES)))
+    return set(settings)
 
 
-# The depth of the table of contents in toc.ncx.
-epub_tocdepth = 3
+def is_deprecated_setting(setting):
+    try:
+        return settings[setting].deprecate_by
+    except KeyError:
+        pass
+
+
+def configcheck_should_ignore(setting):
+    return setting in ignored_settings or is_deprecated_setting(setting)

@@ -1,163 +1,126 @@
-"""
-celery.worker.loop
-~~~~~~~~~~~~~~~~~~
+"""The consumers highly-optimized inner loop."""
+from __future__ import absolute_import, unicode_literals
 
-The consumers highly-optimized inner loop.
-
-"""
-from __future__ import absolute_import
-
+import errno
 import socket
 
-from time import sleep
-from types import GeneratorType as generator
-
-from kombu.utils.eventio import READ, WRITE, ERR
-
-from celery.bootsteps import CLOSE
-from celery.exceptions import InvalidTaskError, SystemTerminate
-from celery.five import Empty
+from celery import bootsteps
+from celery.exceptions import WorkerLostError, WorkerShutdown, WorkerTerminate
+from celery.utils.log import get_logger
 
 from . import state
 
+__all__ = ('asynloop', 'synloop')
 
-def asynloop(obj, connection, consumer, strategies, ns, hub, qos,
-             heartbeat, handle_unknown_message, handle_unknown_task,
-             handle_invalid_task, clock, hbrate=2.0,
-             sleep=sleep, min=min, Empty=Empty):
-    """Non-blocking eventloop consuming messages until connection is lost,
-    or shutdown is requested."""
+# pylint: disable=redefined-outer-name
+# We cache globals and attribute lookups, so disable this warning.
 
-    with hub as hub:
-        update_qos = qos.update
-        update_readers = hub.update_readers
-        readers, writers = hub.readers, hub.writers
-        poll = hub.poller.poll
-        fire_timers = hub.fire_timers
-        scheduled = hub.timer._queue
-        hbtick = connection.heartbeat_check
-        conn_poll_start = connection.transport.on_poll_start
-        conn_poll_empty = connection.transport.on_poll_empty
-        pool_poll_start = obj.pool.on_poll_start
-        drain_nowait = connection.drain_nowait
-        on_task_callbacks = hub.on_task
-        keep_draining = connection.transport.nb_keep_draining
-        errors = connection.connection_errors
-        hub_add, hub_remove = hub.add, hub.remove
+logger = get_logger(__name__)
 
+
+def _quick_drain(connection, timeout=0.1):
+    try:
+        connection.drain_events(timeout=timeout)
+    except Exception as exc:  # pylint: disable=broad-except
+        exc_errno = getattr(exc, 'errno', None)
+        if exc_errno is not None and exc_errno != errno.EAGAIN:
+            raise
+
+
+def _enable_amqheartbeats(timer, connection, rate=2.0):
+    if connection:
+        tick = connection.heartbeat_check
+        heartbeat = connection.get_heartbeat_interval()  # negotiated
         if heartbeat and connection.supports_heartbeats:
-            hub.timer.apply_interval(
-                heartbeat * 1000.0 / hbrate, hbtick, (hbrate, ))
+            timer.call_repeatedly(heartbeat / rate, tick, (rate,))
 
-        def on_task_received(body, message):
-            if on_task_callbacks:
-                [callback() for callback in on_task_callbacks]
-            try:
-                name = body['task']
-            except (KeyError, TypeError):
-                return handle_unknown_message(body, message)
 
-            try:
-                strategies[name](message, body, message.ack_log_error)
-            except KeyError as exc:
-                handle_unknown_task(body, message, exc)
-            except InvalidTaskError as exc:
-                handle_invalid_task(body, message, exc)
+def asynloop(obj, connection, consumer, blueprint, hub, qos,
+             heartbeat, clock, hbrate=2.0):
+    """Non-blocking event loop."""
+    RUN = bootsteps.RUN
+    update_qos = qos.update
+    errors = connection.connection_errors
 
-        consumer.callbacks = [on_task_received]
-        consumer.consume()
-        obj.on_ready()
+    on_task_received = obj.create_task_handler()
 
-        while ns.state != CLOSE and obj.connection:
+    _enable_amqheartbeats(hub.timer, connection, rate=hbrate)
+
+    consumer.on_message = on_task_received
+    obj.controller.register_with_event_loop(hub)
+    obj.register_with_event_loop(hub)
+    consumer.consume()
+    obj.on_ready()
+
+    # did_start_ok will verify that pool processes were able to start,
+    # but this will only work the first time we start, as
+    # maxtasksperchild will mess up metrics.
+    if not obj.restart_count and not obj.pool.did_start_ok():
+        raise WorkerLostError('Could not start worker processes')
+
+    # consumer.consume() may have prefetched up to our
+    # limit - drain an event so we're in a clean state
+    # prior to starting our event loop.
+    if connection.transport.driver_type == 'amqp':
+        hub.call_soon(_quick_drain, connection)
+
+    # FIXME: Use loop.run_forever
+    # Tried and works, but no time to test properly before release.
+    hub.propagate_errors = errors
+    loop = hub.create_loop()
+
+    try:
+        while blueprint.state == RUN and obj.connection:
             # shutdown if signal handlers told us to.
-            if state.should_stop:
-                raise SystemExit()
-            elif state.should_terminate:
-                raise SystemTerminate()
+            should_stop, should_terminate = (
+                state.should_stop, state.should_terminate,
+            )
+            # False == EX_OK, so must use is not False
+            if should_stop is not None and should_stop is not False:
+                raise WorkerShutdown(should_stop)
+            elif should_terminate is not None and should_stop is not False:
+                raise WorkerTerminate(should_terminate)
 
-            # fire any ready timers, this also returns
-            # the number of seconds until we need to fire timers again.
-            poll_timeout = fire_timers(propagate=errors) if scheduled else 1
-
-            # We only update QoS when there is no more messages to read.
+            # We only update QoS when there's no more messages to read.
             # This groups together qos calls, and makes sure that remote
             # control commands will be prioritized over task messages.
             if qos.prev != qos.value:
                 update_qos()
 
-            update_readers(conn_poll_start())
-            pool_poll_start(hub)
-            if readers or writers:
-                connection.more_to_read = True
-                while connection.more_to_read:
-                    try:
-                        events = poll(poll_timeout)
-                        #print('EVENTS: %r' % (hub.repr_events(events), ))
-                    except ValueError:  # Issue 882
-                        return
-                    if not events:
-                        conn_poll_empty()
-                    for fileno, event in events or ():
-                        try:
-                            if event & READ:
-                                cb = readers[fileno]
-                            elif event & WRITE:
-                                cb = writers[fileno]
-                            elif event & ERR:
-                                cb = (readers.get(fileno) or
-                                      writers.get(fileno))
-                                if cb is None:
-                                    continue
-                            if isinstance(cb, generator):
-                                cb.send((fileno, event))
-                            else:
-                                cb(fileno, event)
-                        except (KeyError, Empty):
-                            continue
-                        except socket.error:
-                            if ns.state != CLOSE:  # pragma: no cover
-                                raise
-                    if keep_draining:
-                        drain_nowait()
-                        poll_timeout = 0
-                    else:
-                        connection.more_to_read = False
-            else:
-                # no sockets yet, startup is probably not done.
-                sleep(min(poll_timeout, 0.1))
-
-
-def synloop(obj, connection, consumer, strategies, ns, hub, qos,
-            heartbeat, handle_unknown_message, handle_unknown_task,
-            handle_invalid_task, clock, hbrate=2.0, **kwargs):
-    """Fallback blocking eventloop for transports that doesn't support AIO."""
-
-    def on_task_received(body, message):
+            try:
+                next(loop)
+            except StopIteration:
+                loop = hub.create_loop()
+    finally:
         try:
-            name = body['task']
-        except (KeyError, TypeError):
-            return handle_unknown_message(body, message)
+            hub.reset()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception(
+                'Error cleaning up after event loop: %r', exc)
 
-        try:
-            strategies[name](message, body, message.ack_log_error)
-        except KeyError as exc:
-            handle_unknown_task(body, message, exc)
-        except InvalidTaskError as exc:
-            handle_invalid_task(body, message, exc)
 
-    consumer.register_callback(on_task_received)
+def synloop(obj, connection, consumer, blueprint, hub, qos,
+            heartbeat, clock, hbrate=2.0, **kwargs):
+    """Fallback blocking event loop for transports that doesn't support AIO."""
+    RUN = bootsteps.RUN
+    on_task_received = obj.create_task_handler()
+    perform_pending_operations = obj.perform_pending_operations
+    if getattr(obj.pool, 'is_green', False):
+        _enable_amqheartbeats(obj.timer, connection, rate=hbrate)
+    consumer.on_message = on_task_received
     consumer.consume()
 
     obj.on_ready()
 
-    while ns.state != CLOSE and obj.connection:
+    while blueprint.state == RUN and obj.connection:
         state.maybe_shutdown()
-        if qos.prev != qos.value:         # pragma: no cover
+        if qos.prev != qos.value:
             qos.update()
         try:
+            perform_pending_operations()
             connection.drain_events(timeout=2.0)
         except socket.timeout:
             pass
         except socket.error:
-            if ns.state != CLOSE:  # pragma: no cover
+            if blueprint.state == RUN:
                 raise

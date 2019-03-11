@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
+"""Observer pattern."""
+from __future__ import absolute_import, unicode_literals
+from .signal import Signal
 
-from .signal import Signal  # noqa
+__all__ = ('Signal',)
